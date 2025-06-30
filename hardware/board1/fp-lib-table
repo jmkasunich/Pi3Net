@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "PiPico")(type "KiCad")(uri "C:/Users/jmkasunich/Documents/SWDEV/Pi3Net/hardware/pico.pretty")(options "")(descr ""))
+)
