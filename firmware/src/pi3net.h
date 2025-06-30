@@ -22,6 +22,13 @@ typedef struct p3n_hwdef_s {
     uint32_t tx_ena_pin         : PIN_ID_BITS;
 } p3n_hwdef_t;
 
+extern const p3n_hwdef_t p3n_bus1;
+extern const p3n_hwdef_t p3n_bus2;
+extern const p3n_hwdef_t p3n_tx_up;
+extern const p3n_hwdef_t p3n_rx_up;
+extern const p3n_hwdef_t p3n_tx_dn;
+extern const p3n_hwdef_t p3n_rx_dn;
+
 void p3n_test(void);
 
 
