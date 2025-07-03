@@ -1,0 +1,68 @@
+ .pio_version 0
+ .program pi3net
+
+ .define PUBLIC clocks_per_bit 8
+
+; Repeatedly get one word of data from the TX FIFO, stalling when the FIFO is
+; empty. Write the least significant bit to the OUT pin group.
+
+;.side_set 0
+
+.wrap_target
+PUBLIC txbegin:
+	pull block			    ; grab data (stall if none)
+	set pins 0  [7]		    ; start bit 1
+wordloop:
+	set pins 1  [6]		    ; start bit 2
+    pull ifempty            ; this will never block
+bitloop:
+	out pins 1	[5]		    ; send a bit
+	mov x, status		    ; check tx fifo, 0 = more data
+	jmp !OSRE, bitloop	    ; loop till all bits sent
+    mov pins, x             ; if more data begin start bit 1, else begin stop bit
+	jmp !x, wordloop [6]    ; jump if more data to send; delay to finish start bit 1 or stop bit
+
+	; maybe delay more here to mark message spacing?
+	; generate IRQ to let CPU know message is done
+	; then loop back to wait for next message to appear in fifo
+	jmp txbegin
+
+wait4idle1:
+	jmp pin, wait4idle2		; jump if still high
+PUBLIC rxbegin:
+  set pins 1
+	set y, 17				; got a low, reset timeouts
+	set x, 7				; ((7*2)+2)*17 = 280 clks = 34 bits
+wait4idle2:
+	jmp x--, wait4idle1		; inner loop
+	set x, 7				; reset inner loop
+	jmp y--, wait4idle1		; outer loop
+wait4start:
+  set pins 0
+	wait 0 pin 0			; find falling edge of 1st start pulse
+wait4rise:
+	wait 1 pin 0			; find rising edge of 2nd start pulse
+	set X, 7 [8]			; set bit count, delay to mid data bit
+sample:
+  set pins, 1
+	in pins, 1				; get bit into ISR
+  set pins, 0
+	jmp x--, sample [4]		; loop for 32 bits, one per 8 clocks
+	push noblock        	; save data
+;  set pins, 1
+	jmp pin endofmsg		; check start/stop bit, jump if no more data
+;  set pins, 0
+    jmp wait4rise			; loop around for next word 
+
+endofmsg:
+;  set pins, 1 [3]
+;  set pins, 0
+    jmp rxbegin
+.wrap
+
+
+% c-sdk {
+
+// hello, a comment passed thru the assembler
+
+%}
