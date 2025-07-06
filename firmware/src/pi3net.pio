@@ -1,75 +1,62 @@
 .pio_version 0
 
-; clocks per bit, for delays
-.define PUBLIC cpb 8
+.define PUBLIC p3n_clocks_per_bit	8
+.define PUBLIC p3n_bits_per_word	32
 
-; bits per word
-.define PUBLIC bpw 8
+; shorter local names for the above
+.define cpb 	(p3n_clocks_per_bit)
+.define bpw 	(p3n_bits_per_word)
 
-.program p3n_tx
+.program p3n_rxtx
 
-; send a message
+; program configuration
+; the PIO program has one pin for both receive and transmit
+; the pindir is set to output during transmit only
 
-.fifo tx
+.fifo txrx
 .mov_status txfifo < 1
+.in 32 right bpw
 .out 1 right bpw
 .set 1
 .side_set 1
 
-.wrap_target
 PUBLIC txbegin:
 	pull block      		side 0              ; grab data (stall if none)
+    set pindirs 1           side 0              ; make pin an output
 	set pins 0              side 0  [(cpb-1)]   ; start bit 1
-wordloop:
+tx_word_loop:
 	set pins 1              side 0  [(cpb-2)]   ; start bit 2
     pull ifempty            side 0              ; this will never block
-bitloop:
+tx_bit_loop:
 	out pins, 1             side 0  [(cpb-3)]   ; send a bit
 	mov x, status           side 0              ; check tx fifo, 0 = more data
-	jmp !OSRE, bitloop      side 0              ; loop till all bits sent
+	jmp !OSRE, tx_bit_loop  side 0              ; loop till all bits sent
     mov pins, x             side 0  [(cpb-2)]   ; send start bit 1 or stop bit
-	jmp !x, wordloop        side 0              ; jump if more data to send
-
-    irq wait 0 rel          side 1              ; tell the MCU that we are done
-.wrap
-
-
-.program p3n_rx
-
-; receive a message
-
-.fifo rx
-.in 32 right bpw
-.set 0
-.side_set 1
-
-
-wait4idle1:
-	jmp pin, wait4idle2		side 1              ; jump if still high
-.wrap_target
-PUBLIC rxbegin:                                 ; reset timeouts
+	jmp !x, tx_word_loop    side 0              ; jump if more data to send
+    set pindirs 0           side 1              ; tri-state the output pin
+msg_done:
+    irq nowait 0 rel        side 1              ; tell the MCU that we are done
+    jmp start_wait          side 0              ; start measuring idle time
+wait_loop:
+	jmp pin, still_hi		side 1              ; jump if still high
+PUBLIC start_wait:                              ; reset timeouts
 	set x, (cpb-1)	    	side 0              ; inner loop = 2 bit times
 	set y, (bpw/2)  		side 0              ; outer loop, word size + 2 bits
-wait4idle2:
-	jmp x--, wait4idle1		side 0              ; inner loop
+still_hi:
+	jmp x--, wait_loop		side 0              ; inner loop
 	set x, (cpb-1)  	    side 0              ; reset inner loop
-	jmp y--, wait4idle1		side 0              ; outer loop
-wait4start:
-	wait 0 pin 0			side 0              ; find falling edge of 1st start pulse
-wait4rise:
+	jmp y--, wait_loop		side 0              ; outer loop
+PUBLIC idle_wait:
+	wait 0 pin 0			side 1              ; find falling edge of 1st start pulse
+.wrap_target
 	wait 1 pin 0			side 0              ; find rising edge of 2nd start pulse
 	set X, (bpw-1)          side 0  [cpb+1]     ; set bit count, delay to mid data bit
-sample:
+sample_loop:
 	in pins, 1              side 1              ; get bit into ISR
-	jmp x--, sample         side 0  [cpb-2]     ; loop for each bit
+	jmp x--, sample_loop    side 0  [cpb-2]     ; loop for each bit
 	push noblock            side 0              ; save data
-	jmp pin, message_end	side 1              ; check start/stop bit, jump if no more data
-    jmp wait4rise           side 0              ; loop around for next word 
-
-message_end:
-    nop                     side 0              ; mark end of message
-    nop                     side 1  [cpb]       ; mark end of message
-.wrap                                           ; start looking for next msg
+	jmp pin, msg_done   	side 1              ; check start/stop bit, jump if no more data
+.wrap                                           ; loop around for next word 
 
 
 % c-sdk {

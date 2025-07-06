@@ -15,4 +15,5 @@ target_include_directories(pi3net INTERFACE ${CMAKE_CURRENT_LIST_DIR} )
 # specify dependencies
 target_link_libraries( pi3net INTERFACE
     hardware_pio
+    hardware_dma
 )

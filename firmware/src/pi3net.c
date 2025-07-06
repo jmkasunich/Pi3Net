@@ -3,42 +3,56 @@
 #include "pico/stdlib.h"
 #include "pi3net.h"
 #include "pi3net.pio.h"
-
-#define P3N_PIO_NUM 0
-
-
+#include "hardware/structs/systick.h"
+#include "hardware/structs/pio.h"
 
 
-const p3n_link_hw_t p3n_bus1  = { 1, 1, 1, 16, 16, 17 };
-const p3n_link_hw_t p3n_bus2  = { 1, 1, 1, 22, 22, 28 };
-const p3n_link_hw_t p3n_tx_up = { 1, 0, 0, 4, 0, 0 };
-const p3n_link_hw_t p3n_rx_up = { 0, 1, 0, 0, 5, 0 };
-const p3n_link_hw_t p3n_tx_dn = { 1, 0, 0, 2, 0, 0 };
-const p3n_link_hw_t p3n_rx_dn = { 0, 1, 0, 0, 3, 0 };
+#if (p3n_bits_per_word == 32)
+#define DMA_SIZE DMA_SIZE_32
+#elif (p3n_bits_per_word == 16)
+#define DMA_SIZE DMA_SIZE_16
+#elif (p3n_bits_per_word == 8)
+#define DMA_SIZE DMA_SIZE_8
+#else
+#error "bad bits-per-word"
+#endif
 
+#define BYTES_PER_WORD  (p3n_bits_per_word/8)
 
 #define SCOPE_CHAN_1  (10)
 #define SCOPE_CHAN_2  (14)
 #define SCOPE_CHAN_3  (6)
 #define SCOPE_CHAN_4  (8)
+#define SCOPE_CHAN_5  (12)
 
-#define NUM_BUF 4
+const p3n_link_hw_t p3n_bus1  = { 1, 1, 1, 16, 17, 18 };
+const p3n_link_hw_t p3n_bus2  = { 1, 1, 1, 22, 28, 26 };
+const p3n_link_hw_t p3n_tx_up = { 1, 0, 0, 4, 0, 8 };
+const p3n_link_hw_t p3n_rx_up = { 0, 1, 0, 5, 0, 9 };
+const p3n_link_hw_t p3n_tx_dn = { 1, 0, 0, 2, 0, 6 };
+const p3n_link_hw_t p3n_rx_dn = { 0, 1, 0, 3, 0, 7 };
 
-p3n_buffer_t buffers[NUM_BUF];
+const p3n_link_hw_t p3n_test_tx = { 1, 0, 0, SCOPE_CHAN_2, 0, SCOPE_CHAN_3 };
+const p3n_link_hw_t p3n_test_rx = { 0, 1, 0, SCOPE_CHAN_2, 0, SCOPE_CHAN_4 };
 
-p3n_buffer_t *new_buffer(uint max_size)
+
+p3n_buffer_t *new_buffer(uint max_size_bytes)
 {
     p3n_buffer_t *b;
     b = malloc(sizeof(p3n_buffer_t));
     if ( b == NULL ) {
         return NULL;
     }
-    b->data = malloc(max_size);
+    // round size up to a multiple of 4 bytes
+    max_size_bytes = ( max_size_bytes + 3 ) & ~3;
+    // FIXME - do I need to do anything to ensure that
+    // this is 4-byte aligned?
+    b->data = malloc(max_size_bytes);
     if ( b->data == NULL ) {
         free(b);
         return NULL;
     }
-    b->max_len = max_size;
+    b->max_len = max_size_bytes;
     b->data_len = 0;
     return b;
 }
@@ -47,183 +61,488 @@ p3n_buffer_t *new_buffer(uint max_size)
 p3n_buffer_t *buf1 = NULL;
 p3n_buffer_t *buf2 = NULL;
 
-
-static inline void p3n_tx_program_init(PIO pio, uint sm, uint offset, uint tx_pin, uint side_pin) {
-    pio_sm_config c = p3n_tx_program_get_default_config(offset);
-
-    // Map the state machine's OUT and SET pin groups to one pin, namely the `tx_pin`
-    // parameter to this function.
-    sm_config_set_out_pins(&c, tx_pin, 1);
-    sm_config_set_set_pins(&c, tx_pin, 1);
-    // Set this pin's GPIO function (connect PIO to the pad)
-    pio_gpio_init(pio, tx_pin);
-    // Set the pin direction to output at the PIO
-    pio_sm_set_consecutive_pindirs(pio, sm, tx_pin, 1, true);
-
-    // map the sideset pin (this is temporary for debug only)
-    sm_config_set_sideset_pins(&c, side_pin);
-    // Set this pin's GPIO function (connect PIO to the pad)
-    pio_gpio_init(pio, side_pin);
-    // Set the pin direction to output at the PIO
-    pio_sm_set_consecutive_pindirs(pio, sm, side_pin, 1, true);
-
-    // Load our configuration, and jump to the start of the program
-    pio_sm_init(pio, sm, offset, &c);
-    // Set the state machine running
-    pio_sm_set_enabled(pio, sm, true);
-}
-
-static inline void p3n_rx_program_init(PIO pio, uint sm, uint offset, uint rx_pin, uint side_pin) {
-    pio_sm_config c = p3n_rx_program_get_default_config(offset);
-
-    // Map the state machine's IN pin group to one pin, namely the `rx_pin`
-    // parameter to this function.
-    sm_config_set_in_pins(&c, rx_pin);
-    sm_config_set_jmp_pin(&c, rx_pin);
-
-    // map the sideset pin (this is temporary for debug only)
-    sm_config_set_sideset_pins(&c, side_pin);
-    // Set this pin's GPIO function (connect PIO to the pad)
-    pio_gpio_init(pio, side_pin);
-    // Set the pin direction to output at the PIO
-    pio_sm_set_consecutive_pindirs(pio, sm, side_pin, 1, true);
-
-    // Load our configuration, and jump to the start of the program
-    pio_sm_init(pio, sm, (offset + p3n_rx_offset_rxbegin) & 0x1F, &c);
-    // Set the state machine running
-    pio_sm_set_enabled(pio, sm, true);
-}
-
-#define P3N_MAX_SM 4
-
-PIO p3n_pio = NULL;
-uint p3n_sms[P3N_MAX_SM] = { -1, -1, -1, -1 };
-uint p3n_tx_code_offset = -1;
-uint p3n_rx_code_offset = -1;
+static PIO p3n_pio = NULL;
+static p3n_sm_t p3n_sms[P3N_NUM_STATE_MACHS];
+static int p3n_code_offset;
 
 
-bool p3n_try_pio(PIO pio, uint num_sm)
+void p3n_link_irq_handler(p3n_link_t *link)
 {
-    // attempt to load first program
-    p3n_tx_code_offset = pio_add_program(pio, &p3n_tx_program);
-    if ( p3n_tx_code_offset < 0 ) {
-        goto error;
+    switch ( link->status ) {
+        case P3N_LINK_LISTEN:
+            // stop the DMA
+            dma_channel_abort(link->sm->dma_index);
+            // capture last DMA address
+            char *addr = (char *) dma_channel_hw_addr(link->sm->dma_index)->write_addr;
+            // received a message, figure out how long it is
+            link->buffer->data_len = addr - link->buffer->data;
+            link->status = P3N_LINK_STANDBY;
+            break;
+        case P3N_LINK_SEND:
+            // stop the DMA
+            dma_channel_abort(link->sm->dma_index);
+            // disable the line driver (if present)
+            if ( link->hardware->has_tx_ena ) {
+                gpio_put(link->hardware->tx_ena_pin, 0);
+            }
+            link->status = P3N_LINK_STANDBY;
+            break;
+        case P3N_LINK_STANDBY:
+            // should never get an interrupt while in standby
+            break;
+        case P3N_LINK_IDLE:
+            // should never get an interrupt while in idle
+            break;
+        default:
+            break;
     }
-    // attempt to load second program
-    p3n_rx_code_offset = pio_add_program(pio, &p3n_rx_program);
-    if ( p3n_rx_code_offset < 0 ) {
-        goto error;
-    }
-    // programs loaded, claim the state machines
-    for ( int n = 0 ; n < num_sm ; n++ ) {
-        p3n_sms[n] = pio_claim_unused_sm(pio, false);
-        if ( p3n_sms[n] < 0 ) {
-            goto error;
-        }
-    }
-    p3n_pio = pio;
-    return true;
-
-    // error handling; free resources in the reverse order of obtaining them
-    error:
-    // unclaim any successfully allocated state machines
-    for ( int n = 0 ; n < num_sm ; n++ ) {
-        if ( p3n_sms[n] >= 0 ) {
-            pio_sm_unclaim(pio, p3n_sms[n] );
-            p3n_sms[n] = -1;
-        }
-    }
-    // unload any successfully loaded programs
-    if ( p3n_rx_code_offset >= 0 ) {
-        pio_remove_program(pio, &p3n_rx_program, p3n_rx_code_offset);
-        p3n_rx_code_offset = -1;
-    }
-    if ( p3n_tx_code_offset >= 0 ) {
-        pio_remove_program(pio, &p3n_tx_program, p3n_tx_code_offset);
-        p3n_tx_code_offset = -1;
-    }
-    p3n_pio = NULL;
-    return false;
 }
 
-bool load_programs_claim_sms(uint num_sm)
-{
-    if ( ! p3n_try_pio(pio0, num_sm) ) {
-        if ( ! p3n_try_pio(pio1, num_sm) ) {
-            return false;
-        }
-    }
-    printf("Using PIO # %d, state machines ", pio_get_index(p3n_pio));
-    for ( int n = 0 ; n < P3N_MAX_SM ; n++ ) {
-        printf(" %d", p3n_sms[n]);
-    }
-    printf("\nTX code: %d\nRX code: %d\n", p3n_tx_code_offset, p3n_rx_code_offset);
-}
 
 uint32_t irq_count = 0;
 
 void p3n_pio_irq_handler(void)
 {
     irq_count++;
-    pio_interrupt_clear(p3n_pio, 0);
-    printf("i");
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        if ( pio_interrupt_get(p3n_pio, n) ) {
+            p3n_link_irq_handler(p3n_sms[n].link);
+            pio_interrupt_clear(p3n_pio, n);
+        }
+    }
 }
 
-void print_irq_globals(uint stamp)
+p3n_link_t link1 = { P3N_LINK_IDLE, NULL, NULL, NULL };
+p3n_link_t link2 = { P3N_LINK_IDLE, NULL, NULL, NULL };
+
+#define MSG_LEN 36
+
+void print_buffer(p3n_buffer_t *buf)
 {
-    printf("%d: IRQ: %08x  INTR: %08x  RXF: %d CNT: %10d\n", stamp,  p3n_pio->irq, p3n_pio->intr, 
-                                pio_sm_get_rx_fifo_level(p3n_pio, p3n_sms[1]), irq_count);
+    int l;
+
+    printf("buf: %08x max_len: %d  data_len: %d  data: %08x\n", buf, buf->max_len, buf->data_len, buf->data);
+    // print a few bytes past the end
+    l = buf->data_len + 7;
+    if ( l > buf->max_len ) {
+        l = buf->max_len;
+    }
+    for ( int n = 0 ; n < l ; n ++ ) {
+        if ( ( n % 16 ) == 0 ) {
+            printf("\n%3d: ", n);
+        }
+        printf(" %02x", buf->data[n]);
+    }
+    printf("\n");
 }
+
+void delay_clks(uint32_t clks)
+{
+    uint32_t start, now, dt;
+
+    // systick rolls over at 2^24 = 134ms
+    // only an idiot busywaits that long
+    // clamp it at 100ms
+    if ( clks > 12500000 ) {
+        clks = 12500000;
+    }
+    // it takes about 25 clocks to run
+    // this code when clks = 0
+    if ( clks > 25 ) {
+        clks -= 25;
+    } else {
+        clks = 0;
+    }
+    start = systick_hw->cvr;
+    do {
+        now = systick_hw->cvr;
+        dt = (start - now) & 0x00FFFFFF;
+    } while ( dt < clks );
+}
+
+void delay_us(uint32_t us)
+{
+    // systick rolls over at 2^24 = 134ms
+    // only an idiot busywaits that long
+    // clamp it at 100ms
+    if ( us > 100000 ) {
+        us = 100000;
+    }
+    if ( us == 0 ) {
+        return;
+    }
+    // subtract 26 clocks for call overhead
+    delay_clks(us*125-26);
+}
+
 
 void p3n_test(void)
 {
     uint old_count;
+    bool rb;
+    uint32_t start, now, dt;
 
     printf("Hello from pi3net\n");
     buf1 = new_buffer(100);
     assert(buf1);
     buf2 = new_buffer(500);
     assert(buf2);
-
     gpio_init(SCOPE_CHAN_1);
+    gpio_put(SCOPE_CHAN_1, 0);
     gpio_set_dir(SCOPE_CHAN_1, GPIO_OUT);
-    load_programs_claim_sms(3);
-    p3n_tx_program_init(p3n_pio, p3n_sms[0], p3n_tx_code_offset, SCOPE_CHAN_2, SCOPE_CHAN_4);
-    pio_sm_set_clkdiv(p3n_pio, p3n_sms[0], 15625.0);
-    p3n_rx_program_init(p3n_pio, p3n_sms[1], p3n_rx_code_offset, SCOPE_CHAN_2, SCOPE_CHAN_3);
-    pio_sm_set_clkdiv(p3n_pio, p3n_sms[1], 15625.0);
+    p3n_reset();
+    rb = p3n_init();
+    assert(rb);
+
+    // prepare the transmit link
+    rb = p3n_assign_sm_to_link(&link1);
+    assert(rb);
+    link1.buffer = buf1;
+    link1.hardware = (p3n_link_hw_t *)&(p3n_test_tx);
+    for ( int n = 0 ; n < MSG_LEN ; n++ ) {
+        link1.buffer->data[n] = 0xA5 ^ n;
+    }
+    link1.buffer->data_len = MSG_LEN;
+
+    // prepare the receive link
+    rb = p3n_assign_sm_to_link(&link2);
+    assert(rb);
+    link2.buffer = buf2;
+    link2.hardware = (p3n_link_hw_t *)&(p3n_test_rx);
+    for ( int n = 0 ; n < link2.buffer->max_len ; n += 4 ) {
+        link2.buffer->data[n] = 0xDE;
+        link2.buffer->data[n+1] = 0xAD;
+        link2.buffer->data[n+2] = 0xBE;
+        link2.buffer->data[n+3] = 0xEF;
+    }
+    link2.buffer->data_len = 0;
+
+    // FIXME - move to p3n_init()?
     irq_add_shared_handler(PIO0_IRQ_0, p3n_pio_irq_handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
     irq_set_enabled(PIO0_IRQ_0, true);
+    // FIXME - make dependent on number of state machines
     pio_set_irq0_source_enabled(p3n_pio, pis_interrupt0, true);
-    printf("init done\n");
-    while(1) {
-        old_count = irq_count;
-        print_irq_globals(1);
-        //pio_interrupt_clear(p3n_pio, 0);
-        gpio_put(SCOPE_CHAN_1, 1);
-        pio_sm_put_blocking(p3n_pio, p3n_sms[0], 0xF0F0F0F0);
-        pio_sm_put_blocking(p3n_pio, p3n_sms[0], 0x550FF0AA);
-//        pio_sm_put_blocking(p3n_pio, p3n_sms[0], 0xDEADBE00);
-        pio_sm_put_blocking(p3n_pio, p3n_sms[0], 0xDEADBEFF);
-        pio_sm_put_blocking(p3n_pio, p3n_sms[0], 0xDEADBE3C);
-        while ( irq_count == old_count ) {
-            print_irq_globals(2);
-        }
-        print_irq_globals(3);
-        print_irq_globals(4);
-        print_irq_globals(5);
-        print_irq_globals(6);
-        printf("\nfifo: %d  ", pio_sm_get_rx_fifo_level(p3n_pio, p3n_sms[1]));
-        while ( pio_sm_get_rx_fifo_level(p3n_pio, p3n_sms[1]) > 0 ) {
-            printf("%08x ", pio_sm_get(p3n_pio, p3n_sms[1]));
-        }
-        printf("\n");
-        print_irq_globals(7);
-        sleep_ms(5000);
-        print_irq_globals(8);
-        gpio_put(SCOPE_CHAN_1, 0);
-    }
+    pio_set_irq0_source_enabled(p3n_pio, pis_interrupt1, true);
+
+
+    print_buffer(buf1);
+    print_buffer(buf2);
+
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_start_link(&link2, 10000000);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    //delay_us(50);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_start_link(&link1, 10000000);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    delay_us(50);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_receive(&link2, buf2);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    delay_us(10);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_transmit(&link1, buf1);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+
+    delay_us(50);
+
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_receive(&link2, buf2);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    delay_us(10);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_transmit(&link1, buf1);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+
+    print_buffer(buf2);
+
+    while(1);
+    
 
 }
 
+bool p3n_receive(p3n_link_t *link, p3n_buffer_t *buf)
+{
+    dma_channel_config c;
+    dreq_num_t dreq;
+
+    if ( link->status != P3N_LINK_STANDBY ) {
+        printf("status\n");
+        return false;
+    }
+    if ( ! link->hardware->can_receive ) {
+        printf("can't receive\n");
+        return false;
+    }
+    if ( ( buf == NULL ) || ( buf->max_len == 0 ) ) {
+        printf("bad buf\n");
+        return false;
+    }
+    // build the DMA controller configuration
+    c = dma_channel_get_default_config(link->sm->dma_index);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    if ( pio_get_index(p3n_pio) == 0 ) {
+        dreq = DREQ_PIO0_RX0 + link->sm->sm_index;
+    } else {
+        dreq = DREQ_PIO1_RX0 + link->sm->sm_index;
+    }
+    channel_config_set_dreq(&c, dreq);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE);
+    // is the PIO ready to receive?
+    if ( pio_sm_get_pc(p3n_pio, link->sm->sm_index) != (p3n_rxtx_offset_idle_wait + p3n_code_offset) ) {
+        printf("bad PC = %d\n", pio_sm_get_pc(p3n_pio, link->sm->sm_index));
+        return false;
+    }
+    // save the buffer
+    link->buffer = buf;
+    // start the DMA transfer
+    dma_channel_configure(link->sm->dma_index, &c, link->buffer->data, 
+                            ((char *)&(p3n_pio->rxf[link->sm->sm_index]))+(4-BYTES_PER_WORD),
+                             link->buffer->max_len / BYTES_PER_WORD, true);
+    link->status = P3N_LINK_LISTEN;
+    return true;
+}
+
+bool p3n_transmit(p3n_link_t *link, p3n_buffer_t *buf)
+{
+    dma_channel_config c;
+    dreq_num_t dreq;
+
+    if ( link->status != P3N_LINK_STANDBY ) {
+        printf("status\n");
+        return false;
+    }
+    if ( ! link->hardware->can_transmit ) {
+        printf("can't transmit\n");
+        return false;
+    }
+    if ( ( buf == NULL ) || ( buf->data_len == 0 ) ) {
+        printf("bad buf\n");
+        return false;
+    }
+    // build the DMA controller configuration
+    c = dma_channel_get_default_config(link->sm->dma_index);
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    if ( pio_get_index(p3n_pio) == 0 ) {
+        dreq = DREQ_PIO0_TX0 + link->sm->sm_index;
+    } else {
+        dreq = DREQ_PIO1_TX0 + link->sm->sm_index;
+    }
+    channel_config_set_dreq(&c, dreq);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE);
+    // is the PIO ready to send?
+    if ( pio_sm_get_pc(p3n_pio, link->sm->sm_index) != (p3n_rxtx_offset_idle_wait + p3n_code_offset) ) {
+        printf("bad PC = %d\n", pio_sm_get_pc(p3n_pio, link->sm->sm_index));
+        return false;
+    }
+    // save the buffer
+    link->buffer = buf;
+    // enable the line driver, if present
+    if ( link->hardware->has_tx_ena ) {
+        gpio_put(link->hardware->tx_ena_pin, 1);
+    }
+    // make the PIO jump to the transmit routine
+    pio_sm_exec(p3n_pio, link->sm->sm_index, pio_encode_jmp(p3n_rxtx_offset_txbegin + p3n_code_offset));
+    // start the DMA transfer
+    dma_channel_configure(link->sm->dma_index, &c, &(p3n_pio->txf[link->sm->sm_index]),
+                             link->buffer->data, (link->buffer->data_len+(BYTES_PER_WORD-1))/BYTES_PER_WORD, true);
+    link->status = P3N_LINK_SEND;
+    return true;
+}
+
+
+
+
+bool p3n_start_link(p3n_link_t *link, uint bitrate)
+{
+    float pio_clk, div;
+
+    if ( link->status != P3N_LINK_IDLE ) {
+        return false;
+    }
+    if ( link->hardware == NULL ) return false;
+    if ( link->sm == NULL ) return false;
+    // set the bit rate
+    pio_sm_config c = p3n_rxtx_program_get_default_config(p3n_code_offset);
+    pio_clk = 125000000.0 / p3n_clocks_per_bit;
+    div = pio_clk / bitrate;
+    sm_config_set_clkdiv(&c, div);
+    // enable pullup on the data pin (it might be bidirectional)
+    gpio_pull_up(link->hardware->data_pin);
+    // Map the state machine's OUT and SET pin groups
+    // as well as the IN pin group and the JMP pin
+    // to the data pin
+    sm_config_set_out_pins(&c, link->hardware->data_pin, 1);
+    sm_config_set_set_pins(&c, link->hardware->data_pin, 1);
+    sm_config_set_in_pins(&c, link->hardware->data_pin);
+    sm_config_set_jmp_pin(&c, link->hardware->data_pin);
+    // Set the data pin's GPIO function (connect PIO to the pad)
+    pio_gpio_init(p3n_pio, link->hardware->data_pin);
+    if ( link->hardware->has_tx_ena ) {
+        // the PIO doeesn't manipulate this pin, it ns normal GPIO
+        gpio_init(link->hardware->tx_ena_pin);
+        // disable transmitter
+        gpio_put(link->hardware->tx_ena_pin, 0);
+        gpio_set_dir(link->hardware->tx_ena_pin, 1);
+    }
+    // map the sideset pin (this is temporary for debug only)
+    sm_config_set_sideset_pins(&c, link->hardware->sideset_pin);
+    // Set this pin's GPIO function (connect PIO to the pad)
+    pio_gpio_init(p3n_pio, link->hardware->sideset_pin);
+    // Set the pin direction to output at the PIO
+    pio_sm_set_consecutive_pindirs(p3n_pio, link->sm->sm_index, link->hardware->sideset_pin, 1, true);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(p3n_pio, link->sm->sm_index, p3n_code_offset+p3n_rxtx_offset_start_wait, &c);
+    // make the data pin an input for now
+    pio_sm_exec(p3n_pio, link->sm->sm_index, pio_encode_set(pio_pindirs, 0));
+    // but if/when it becomes an output, it should be high
+    pio_sm_exec(p3n_pio, link->sm->sm_index, pio_encode_set(pio_pins, 1));
+
+    // Set the state machine running
+    pio_sm_set_enabled(p3n_pio, link->sm->sm_index, true);
+    link->status = P3N_LINK_STANDBY;
+    return true;
+}
+
+
+
+
+
+
+static bool try_pio(PIO pio)
+{
+    // mark that we might have allocated things
+    // (in case we fail and someone needs to clean up)
+    p3n_pio = pio;
+    // attempt to load the program
+    p3n_code_offset = pio_add_program(pio, &p3n_rxtx_program);
+    if ( p3n_code_offset < 0 ) {
+        return false;
+    }
+    // program loaded, claim the state machines
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        p3n_sms[n].sm_index = pio_claim_unused_sm(pio, false);
+        if ( p3n_sms[n].sm_index < 0 ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// this resets all of the global data without checking or freeing anything
+// should only be done after MCU reset
+void p3n_reset(void)
+{
+    p3n_sm_t *sm;
+    // initialize to "nothing claimed"
+    p3n_pio = NULL;
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        sm = &(p3n_sms[n]);
+        sm->sm_index = -1;
+        sm->dma_index = -1;
+        sm->link = NULL;
+    }
+    p3n_code_offset = -1;
+}
+
+
+void p3n_uninit(void)
+{
+    p3n_sm_t *sm;
+    if ( p3n_pio == NULL ) {
+        // either initial boot, or already un-initialized
+        // nothing to do
+        return;
+    }
+    // release allocated resources
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        sm = &(p3n_sms[n]);
+        if ( sm->sm_index >= 0 ) {
+            pio_sm_unclaim(p3n_pio, sm->sm_index);
+            sm->sm_index = -1;
+        }
+        if ( sm->dma_index >= 0 ) {
+            dma_channel_unclaim(sm->dma_index);
+            sm->dma_index = -1;
+        }
+        if ( sm->link != NULL ) {
+            sm->link->sm = NULL;
+        }
+        sm->link = NULL;
+    }
+    // unload the PIO program
+    if ( p3n_code_offset >= 0 ) {
+        pio_remove_program(p3n_pio, &p3n_rxtx_program, p3n_code_offset);
+        p3n_code_offset = -1;
+    }
+    // mark system as un-initialized
+    p3n_pio = NULL;
+}
+
+
+bool p3n_init(void)
+{
+    p3n_sm_t *sm;
+    if ( ! try_pio(pio0) ) {
+        p3n_uninit();
+        if ( ! try_pio(pio1) ) {
+            p3n_uninit();
+            return false;
+        }
+    }
+    // state machines claimed, claim DMA channel for each
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        sm = &(p3n_sms[n]);
+        sm->dma_index = dma_claim_unused_channel(false);
+        if ( sm->dma_index < 0 ) {
+            p3n_uninit();
+            return false;
+        }
+    }
+    printf("Using PIO # %d, sm/dma ", pio_get_index(p3n_pio));
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        sm = &(p3n_sms[n]);
+        printf(" %d/%d", sm->sm_index, sm->dma_index);
+    }
+    printf("\ncode offset: %d\n", p3n_code_offset);
+}
+
+
+bool p3n_assign_sm_to_link(p3n_link_t *link)
+{
+    p3n_sm_t *sm;
+    if ( link->sm != NULL ) {
+        // state machine already assigned, nothing to do
+        return true;
+    }
+    // find free state machine (and dma channel)
+    for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
+        sm = &(p3n_sms[n]);
+        if ( sm->link == NULL ) {
+            // it's free, use it
+            link->sm = sm;
+            sm->link = link;
+            return true;
+        }
+    }
+    // no free state machine found
+    return false;
+}
+
+void p3n_release_sm_from_link(p3n_link_t *link)
+{
+    if ( link->sm != NULL ) {
+        link->sm->link = NULL;
+        link->sm = NULL;
+    }
+}
 
