@@ -64,12 +64,6 @@ typedef enum {
     P3N_LINK_LISTEN
 } p3n_link_status_t;
 
-typedef enum {
-    P3N_SM_FREE = 0,
-    P3N_SM_IDLE,
-    P3N_SM_INUSE
-} p3n_sm_status_t;
-
 
 /**********************************************************
  * This structure defines the status of a state machine and
@@ -80,8 +74,8 @@ typedef enum {
  * are active at any given time.
  */
 typedef struct p3n_sm_s {
-    int                 sm_index;
-    int                 dma_index;
+    int8_t              sm_index;
+    int8_t              dma_index;
     struct p3n_link_s   *link;
 } p3n_sm_t;
 

@@ -25,6 +25,16 @@
 #define SCOPE_CHAN_4  (8)
 #define SCOPE_CHAN_5  (12)
 
+
+#define TX 1
+#define RX 2
+#define TESTMODE RX
+
+p3n_buffer_t *buffers[6] = { NULL, NULL, NULL, NULL };
+p3n_link_t links[6] = { P3N_LINK_IDLE, NULL, NULL, NULL };
+
+#define BITRATE 100000
+
 const p3n_link_hw_t p3n_bus1  = { 1, 1, 1, 16, 17, 18 };
 const p3n_link_hw_t p3n_bus2  = { 1, 1, 1, 22, 28, 26 };
 const p3n_link_hw_t p3n_tx_up = { 1, 0, 0, 4, 0, 8 };
@@ -45,8 +55,6 @@ p3n_buffer_t *new_buffer(uint max_size_bytes)
     }
     // round size up to a multiple of 4 bytes
     max_size_bytes = ( max_size_bytes + 3 ) & ~3;
-    // FIXME - do I need to do anything to ensure that
-    // this is 4-byte aligned?
     b->data = malloc(max_size_bytes);
     if ( b->data == NULL ) {
         free(b);
@@ -58,9 +66,6 @@ p3n_buffer_t *new_buffer(uint max_size_bytes)
 }
 
 
-p3n_buffer_t *buf1 = NULL;
-p3n_buffer_t *buf2 = NULL;
-
 static PIO p3n_pio = NULL;
 static p3n_sm_t p3n_sms[P3N_NUM_STATE_MACHS];
 static int p3n_code_offset;
@@ -68,6 +73,7 @@ static int p3n_code_offset;
 
 void p3n_link_irq_handler(p3n_link_t *link)
 {
+    printf("-%d", link-links);
     switch ( link->status ) {
         case P3N_LINK_LISTEN:
             // stop the DMA
@@ -104,18 +110,14 @@ uint32_t irq_count = 0;
 void p3n_pio_irq_handler(void)
 {
     irq_count++;
+    printf("i%d", irq_count);
     for ( int n = 0 ; n < P3N_NUM_STATE_MACHS ; n++ ) {
-        if ( pio_interrupt_get(p3n_pio, n) ) {
+        if ( pio_interrupt_get(p3n_pio, p3n_sms[n].sm_index) ) {
             p3n_link_irq_handler(p3n_sms[n].link);
-            pio_interrupt_clear(p3n_pio, n);
+            pio_interrupt_clear(p3n_pio, p3n_sms[n].sm_index);
         }
     }
 }
-
-p3n_link_t link1 = { P3N_LINK_IDLE, NULL, NULL, NULL };
-p3n_link_t link2 = { P3N_LINK_IDLE, NULL, NULL, NULL };
-
-#define MSG_LEN 36
 
 void print_buffer(p3n_buffer_t *buf)
 {
@@ -135,6 +137,57 @@ void print_buffer(p3n_buffer_t *buf)
     }
     printf("\n");
 }
+
+void print_buffer_as_string(p3n_buffer_t *buf)
+{
+    int l;
+
+    printf("buf: %08x max_len: %d  data_len: %d  data: '", buf, buf->max_len, buf->data_len);
+    // print the data
+    l = buf->data_len;
+    if ( l > buf->max_len ) {
+        l = buf->max_len;
+    }
+    for ( int n = 0 ; n < l ; n ++ ) {
+        printf("%c", buf->data[n]);
+    }
+    printf("'\n");
+}
+
+void copy_string_to_buffer(p3n_buffer_t *buf, char *str)
+{
+    char *s, *d, c;
+    int n;
+
+    s = str;
+    d = buf->data;
+    n = 0;
+    while ( n < buf->max_len ) { 
+        c = *(s++);
+        *(d++) = c;
+        n++;
+        if ( c == '\0' ) {
+            // done
+            buf->data_len = n;
+            return;
+        }
+    }
+    // buffer full
+    buf->data_len = n;
+    return;
+}
+
+void erase_buffer(p3n_buffer_t *buf)
+{
+    for ( int n = 0 ; n < buf->max_len ; n += 4 ) {
+        buf->data[n] = 0xDE;
+        buf->data[n+1] = 0xAD;
+        buf->data[n+2] = 0xBE;
+        buf->data[n+3] = 0xEF;
+    }
+    buf->data_len = 0;
+}
+
 
 void delay_clks(uint32_t clks)
 {
@@ -175,6 +228,16 @@ void delay_us(uint32_t us)
     delay_clks(us*125-26);
 }
 
+void delay_ms(uint32_t ms)
+{
+    // sometimes I'm an idiot
+    while ( ms > 0 ) {
+        delay_us(1000);
+        ms--;
+    }
+}
+
+
 
 void p3n_test(void)
 {
@@ -183,10 +246,22 @@ void p3n_test(void)
     uint32_t start, now, dt;
 
     printf("Hello from pi3net\n");
-    buf1 = new_buffer(100);
-    assert(buf1);
-    buf2 = new_buffer(500);
-    assert(buf2);
+    for ( int n = 0 ; n < 6 ; n++ ) {
+        buffers[n] = new_buffer(100);
+        assert(buffers[n]);
+    }
+    for ( int n = 0 ; n < 6 ; n++ ) {
+        links[n].buffer = NULL;
+        links[n].hardware = NULL;
+        links[n].sm = NULL;
+        links[n].status = P3N_LINK_IDLE;
+    }
+    links[0].hardware = (p3n_link_hw_t *)&(p3n_bus1);
+    links[1].hardware = (p3n_link_hw_t *)&(p3n_bus2);
+    links[2].hardware = (p3n_link_hw_t *)&(p3n_tx_up);
+    links[3].hardware = (p3n_link_hw_t *)&(p3n_rx_up);
+    links[4].hardware = (p3n_link_hw_t *)&(p3n_tx_dn);
+    links[5].hardware = (p3n_link_hw_t *)&(p3n_rx_dn);
     gpio_init(SCOPE_CHAN_1);
     gpio_put(SCOPE_CHAN_1, 0);
     gpio_set_dir(SCOPE_CHAN_1, GPIO_OUT);
@@ -194,28 +269,37 @@ void p3n_test(void)
     rb = p3n_init();
     assert(rb);
 
-    // prepare the transmit link
-    rb = p3n_assign_sm_to_link(&link1);
+#if (TESTMODE == TX )
+    // prepare the transmit links
+    rb = p3n_assign_sm_to_link(&links[0]);
     assert(rb);
-    link1.buffer = buf1;
-    link1.hardware = (p3n_link_hw_t *)&(p3n_test_tx);
-    for ( int n = 0 ; n < MSG_LEN ; n++ ) {
-        link1.buffer->data[n] = 0xA5 ^ n;
-    }
-    link1.buffer->data_len = MSG_LEN;
+    copy_string_to_buffer(buffers[0], "bus1, using buffers[0]");
+    rb = p3n_assign_sm_to_link(&links[1]);
+    assert(rb);
+    copy_string_to_buffer(buffers[1], "bus2, using buffers[1]");
+    rb = p3n_assign_sm_to_link(&links[2]);
+    assert(rb);
+    copy_string_to_buffer(buffers[2], "neighbor up, using buffers[2]");
+    rb = p3n_assign_sm_to_link(&links[4]);
+    assert(rb);
+    copy_string_to_buffer(buffers[4], "neighbor down, using buffers[4]");
+#endif
 
-    // prepare the receive link
-    rb = p3n_assign_sm_to_link(&link2);
+#if (TESTMODE == RX )
+    // prepare the receive links
+    rb = p3n_assign_sm_to_link(&links[0]);
     assert(rb);
-    link2.buffer = buf2;
-    link2.hardware = (p3n_link_hw_t *)&(p3n_test_rx);
-    for ( int n = 0 ; n < link2.buffer->max_len ; n += 4 ) {
-        link2.buffer->data[n] = 0xDE;
-        link2.buffer->data[n+1] = 0xAD;
-        link2.buffer->data[n+2] = 0xBE;
-        link2.buffer->data[n+3] = 0xEF;
-    }
-    link2.buffer->data_len = 0;
+    erase_buffer(buffers[0]);
+    rb = p3n_assign_sm_to_link(&links[1]);
+    assert(rb);
+    erase_buffer(buffers[1]);
+    rb = p3n_assign_sm_to_link(&links[3]);
+    assert(rb);
+    erase_buffer(buffers[3]);
+    rb = p3n_assign_sm_to_link(&links[5]);
+    assert(rb);
+    erase_buffer(buffers[5]);
+#endif
 
     // FIXME - move to p3n_init()?
     irq_add_shared_handler(PIO0_IRQ_0, p3n_pio_irq_handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
@@ -223,48 +307,94 @@ void p3n_test(void)
     // FIXME - make dependent on number of state machines
     pio_set_irq0_source_enabled(p3n_pio, pis_interrupt0, true);
     pio_set_irq0_source_enabled(p3n_pio, pis_interrupt1, true);
+    pio_set_irq0_source_enabled(p3n_pio, pis_interrupt2, true);
+    pio_set_irq0_source_enabled(p3n_pio, pis_interrupt3, true);
 
-
-    print_buffer(buf1);
-    print_buffer(buf2);
-
-    gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_start_link(&link2, 10000000);
-    assert(rb);
-    gpio_put(SCOPE_CHAN_1, 0);
-    //delay_us(50);
-    gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_start_link(&link1, 10000000);
-    assert(rb);
-    gpio_put(SCOPE_CHAN_1, 0);
-    delay_us(50);
-    gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_receive(&link2, buf2);
-    assert(rb);
-    gpio_put(SCOPE_CHAN_1, 0);
-    delay_us(10);
-    gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_transmit(&link1, buf1);
-    assert(rb);
-    gpio_put(SCOPE_CHAN_1, 0);
-
-    delay_us(50);
+#if (TESTMODE == TX)
 
     gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_receive(&link2, buf2);
+    rb = p3n_start_link(&links[0], BITRATE);
     assert(rb);
     gpio_put(SCOPE_CHAN_1, 0);
-    delay_us(10);
+    rb = p3n_start_link(&links[1], BITRATE);
+    assert(rb);
     gpio_put(SCOPE_CHAN_1, 1);
-    rb = p3n_transmit(&link1, buf1);
+    rb = p3n_start_link(&links[2], BITRATE);
     assert(rb);
     gpio_put(SCOPE_CHAN_1, 0);
+    rb = p3n_start_link(&links[4], BITRATE);
+    assert(rb);
+    delay_ms(1);
+    while ( 1 ) {
+        gpio_put(SCOPE_CHAN_1, 1);
+        rb = p3n_transmit(&links[0], buffers[0]);
+        assert(rb);
+        gpio_put(SCOPE_CHAN_1, 0);
+        delay_ms(1000);
 
-    print_buffer(buf2);
+        gpio_put(SCOPE_CHAN_1, 1);
+        rb = p3n_transmit(&links[1], buffers[1]);
+        assert(rb);
+        gpio_put(SCOPE_CHAN_1, 0);
+        delay_ms(1000);
 
-    while(1);
-    
+        gpio_put(SCOPE_CHAN_1, 1);
+        rb = p3n_transmit(&links[2], buffers[2]);
+        assert(rb);
+        gpio_put(SCOPE_CHAN_1, 0);
+        delay_ms(1000);
 
+        gpio_put(SCOPE_CHAN_1, 1);
+        rb = p3n_transmit(&links[4], buffers[4]);
+        assert(rb);
+        gpio_put(SCOPE_CHAN_1, 0);
+        delay_ms(1000);
+    }
+#endif
+
+#if (TESTMODE == RX)
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_start_link(&links[0], BITRATE);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    rb = p3n_start_link(&links[1], BITRATE);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_start_link(&links[3], BITRATE);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    rb = p3n_start_link(&links[5], BITRATE);
+    assert(rb);
+    delay_ms(1);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_receive(&links[0], buffers[0]);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    rb = p3n_receive(&links[1], buffers[1]);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 1);
+    rb = p3n_receive(&links[3], buffers[3]);
+    assert(rb);
+    gpio_put(SCOPE_CHAN_1, 0);
+    rb = p3n_receive(&links[5], buffers[5]);
+    assert(rb);
+
+    while ( 1 ) {
+        for ( int n = 0 ; n < 6 ; n++ ) {
+            if ( n == 2 ) continue;
+            if ( n == 4 ) continue;
+            if ( links[n].status != P3N_LINK_LISTEN ) {
+                gpio_put(SCOPE_CHAN_1, 1);
+                printf("\nLink %d:\n", n);
+                print_buffer_as_string(links[n].buffer);
+                erase_buffer(links[n].buffer);
+                rb = p3n_receive(&links[n], buffers[n]);
+                assert(rb);
+                gpio_put(SCOPE_CHAN_1, 0);
+            }
+        }
+    }
+#endif
 }
 
 bool p3n_receive(p3n_link_t *link, p3n_buffer_t *buf)
