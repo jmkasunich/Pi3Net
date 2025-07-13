@@ -33,7 +33,7 @@
 p3n_buffer_t *buffers[6] = { NULL, NULL, NULL, NULL };
 p3n_link_t links[6] = { P3N_LINK_IDLE, NULL, NULL, NULL };
 
-#define BITRATE 100000
+#define BITRATE 10000000
 
 const p3n_link_hw_t p3n_bus1  = { 1, 1, 1, 16, 17, 18 };
 const p3n_link_hw_t p3n_bus2  = { 1, 1, 1, 22, 28, 26 };
@@ -162,7 +162,7 @@ void copy_string_to_buffer(p3n_buffer_t *buf, char *str)
     s = str;
     d = buf->data;
     n = 0;
-    while ( n < buf->max_len ) { 
+    while ( n < buf->max_len ) {
         c = *(s++);
         *(d++) = c;
         n++;
@@ -238,6 +238,69 @@ void delay_ms(uint32_t ms)
 }
 
 
+uint32_t buffer_crc32_calc(p3n_buffer_t *buf)
+{
+    uint32_t result;
+    int dma_chan, xfer_count;
+    dma_channel_config c;
+    static uint32_t dummy;  // this shouldn't be on the stack
+
+    // append zeros if needed to pad data length to multiple of 4
+    while ( buf->data_len & 3 ) {
+        buf->data[buf->data_len] = 0;
+        buf->data_len++;
+    }
+    xfer_count = buf->data_len >> 2;
+    // do the calc by dma'ing the data to a dummy address
+    // with the sniffer enabled
+    dma_chan = dma_claim_unused_channel(true);
+    c = dma_channel_get_default_config(dma_chan);
+    // default config is already almost perfect:
+    //  incr read addr, don't incr write addr, 32-bit transfers
+    //  DREQ_FORCE (run at max speed), no byte swap, low priority
+    // make the only change needed
+    channel_config_set_sniff_enable(&c, true);
+    // configure the sniffer
+    dma_sniffer_enable(dma_chan, 0, true);
+    dma_sniffer_set_data_accumulator(0xFFFFFFFF);
+    // start the transfer
+    dma_channel_configure(dma_chan, &c, &dummy, buf->data, xfer_count, true);
+    // wait for done
+    dma_channel_wait_for_finish_blocking(dma_chan);
+    result = dma_sniffer_get_data_accumulator();
+    dma_channel_unclaim(dma_chan);
+    return result;
+}
+
+
+// appends a 32-bit CRC to the data in the buffer
+// rounds data_len up to a multiple of 4, then adds 4 more for the CRC value
+void buffer_crc_set(p3n_buffer_t *buf)
+{
+    uint32_t crc;
+
+    // make sure there is room for the CRC
+    assert(buf->max_len >= ((buf->data_len+7) & ~3) );
+    crc = buffer_crc32_calc(buf);
+    // append CRC to data
+    *(uint32_t *)&(buf->data[buf->data_len]) = crc;
+    buf->data_len += 4;
+}
+
+// checks the 32-but CRC of the data in the buffer
+// assumes that the last four bytes are the CRC, calculates the CRC for the rest
+bool buffer_crc_check(p3n_buffer_t *buf)
+{
+    uint32_t crc;
+
+    assert(buf->data_len > 4 );
+    buf->data_len -= 4;
+    crc = buffer_crc32_calc(buf);
+    // test for match
+    return ( *(uint32_t *)&(buf->data[buf->data_len]) == crc );
+}
+
+
 
 void p3n_test(void)
 {
@@ -273,31 +336,39 @@ void p3n_test(void)
     // prepare the transmit links
     rb = p3n_assign_sm_to_link(&links[0]);
     assert(rb);
-    copy_string_to_buffer(buffers[0], "bus1, using buffers[0]");
     rb = p3n_assign_sm_to_link(&links[1]);
     assert(rb);
-    copy_string_to_buffer(buffers[1], "bus2, using buffers[1]");
     rb = p3n_assign_sm_to_link(&links[2]);
     assert(rb);
-    copy_string_to_buffer(buffers[2], "neighbor up, using buffers[2]");
     rb = p3n_assign_sm_to_link(&links[4]);
     assert(rb);
+    copy_string_to_buffer(buffers[0], "bus1, using buffers[0]");
+    copy_string_to_buffer(buffers[1], "bus2, using buffers[1]");
+    copy_string_to_buffer(buffers[2], "neighbor up, using buffers[2]");
     copy_string_to_buffer(buffers[4], "neighbor down, using buffers[4]");
+printf("Buffer 0 before CRC\n");
+print_buffer(buffers[0]);
+    buffer_crc_set(buffers[0]);
+    buffer_crc_set(buffers[1]);
+    buffer_crc_set(buffers[2]);
+    buffer_crc_set(buffers[4]);
+printf("Buffer 0 after CRC\n");
+print_buffer(buffers[0]);
 #endif
 
 #if (TESTMODE == RX )
     // prepare the receive links
     rb = p3n_assign_sm_to_link(&links[0]);
     assert(rb);
-    erase_buffer(buffers[0]);
     rb = p3n_assign_sm_to_link(&links[1]);
     assert(rb);
-    erase_buffer(buffers[1]);
     rb = p3n_assign_sm_to_link(&links[3]);
     assert(rb);
-    erase_buffer(buffers[3]);
     rb = p3n_assign_sm_to_link(&links[5]);
     assert(rb);
+    erase_buffer(buffers[0]);
+    erase_buffer(buffers[1]);
+    erase_buffer(buffers[3]);
     erase_buffer(buffers[5]);
 #endif
 
@@ -386,6 +457,12 @@ void p3n_test(void)
             if ( links[n].status != P3N_LINK_LISTEN ) {
                 gpio_put(SCOPE_CHAN_1, 1);
                 printf("\nLink %d:\n", n);
+                print_buffer(links[n].buffer);
+                if ( buffer_crc_check(links[n].buffer) ) {
+                    printf("CRC pass\n");
+                } else {
+                    printf("ERROR: CRC FAILED!\n");
+                }
                 print_buffer_as_string(links[n].buffer);
                 erase_buffer(links[n].buffer);
                 rb = p3n_receive(&links[n], buffers[n]);

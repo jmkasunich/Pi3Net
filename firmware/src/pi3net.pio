@@ -1,7 +1,7 @@
 .pio_version 0
 
 .define PUBLIC p3n_clocks_per_bit	8
-.define PUBLIC p3n_bits_per_word	8
+.define PUBLIC p3n_bits_per_word	32
 
 ; shorter local names for the above
 .define cpb 	(p3n_clocks_per_bit)
