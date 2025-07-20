@@ -1,7 +1,7 @@
 .pio_version 0
 
-.define PUBLIC p3n_clocks_per_bit       8
-.define PUBLIC p3n_bits_per_word        32
+.define PUBLIC p3n_clocks_per_bit       10
+.define PUBLIC p3n_bits_per_word        8
 
 .define PUBLIC p3n_silence_delay_bits   8
 .define PUBLIC p3n_post_cmd_delay_bits  22
@@ -35,47 +35,47 @@ tx_start:
     set pins 1              side 0              ; enable external transmitter, if any
     mov osr, ~null          side 0              ; put 1's in osr
     out pindirs, 1          side 0              ; make the data pin an output
-    pull block      		side 0              ; get first data word (stall if none)
+    pull block              side 1              ; get first data word (stall if none)
     mov pins, null          side 0  [(cpb-1)]   ; send 1st start bit, wait one bit time
 tx_word_loop:
     mov pins, ~null         side 0  [(cpb-2)]   ; send 2nd start bit
-    pull ifempty            side 0              ; this will never block
+    pull ifempty            side 1              ; this will never block
 tx_bit_loop:
     out pins, 1             side 0  [(cpb-3)]   ; send a bit
     mov x, status           side 0              ; check tx fifo, 0 = more data
     jmp !OSRE, tx_bit_loop  side 0              ; loop till all bits sent
     mov pins, x             side 0  [(cpb-2)]   ; send start bit 1 or stop bit
     jmp !x, tx_word_loop    side 0              ; jump if more data to send
-    out pindirs, 1          side 1              ; tri-state the output pin
+    out pindirs, 1          side 0              ; tri-state the output pin
     set pins 0              side 0              ; disable external transmitter, if any
 msg_done:
     irq nowait 0 rel        side 1              ; tell the MCU that we are done
 post_cmd_delay:
-    jmp y--, post_cmd_delay side 0              ; wait before accepting next command
-PUBLIC cmd_start:
+    jmp y--, post_cmd_delay side 0  [(cpb-1)]   ; wait y bit times before next command
+PUBLIC p3n_entry:
     pull block              side 1              ; get command into OSR, stall if none
-    out y, (sdb)            side 0              ; get silence delay
-    mov x, y                side 0              ; init silence timer
+    out y, (sdb)            side 1              ; get silence delay
+    mov x, y                side 1              ; init silence timer
 silence_loop:
-    jmp pin, still_quiet    side 1              ; jump if pin high (quiet)
+    jmp pin, still_quiet    side 0              ; jump if pin high (quiet)
     mov x, y                side 0              ; not quiet, reset timer
 still_quiet:
     jmp x--, silence_loop   side 0              ; loop till quiet long enough
 start_cmd:
     out x, (cb)             side 1              ; get command to x
-    out y, (pdb)            side 0              ; save post-command delay for later in y
-    jmp !x, tx_start        side 0              ; start the appropriate command
+    out y, (pdb)            side 1              ; save post-command delay for later in y
+    jmp !x, tx_start        side 1              ; start the appropriate command
 rx_start:
-    wait 0 pin 0            side 1              ; find falling edge of 1st start pulse
+    wait 0 pin 0            side 0              ; find falling edge of 1st start pulse
 rx_word_loop:
 .wrap_target
-    wait 1 pin 0            side 0  [(cpb-2)]   ; find rising edge of 2nd start pulse
-    set X, (bpw-1)          side 0  [(cpb/2)]   ; set bit count, delay to mid data bit
+    wait 1 pin 0            side 1              ; find rising edge of 2nd start pulse
+    set X, (bpw-1)          side 0  [(cpb+(cpb/2)-2)]   ; set bit count, delay to mid data bit
 rx_bit_loop:
-    in pins, 1              side 1              ; get bit into ISR
+    in pins, 1              side 0              ; get bit into ISR
     jmp x--, rx_bit_loop    side 0  [(cpb-2)]   ; loop for each bit
-    push noblock            side 0              ; save data
-    jmp pin, msg_done       side 1              ; check start/stop bit, jump if no more data
+    push noblock            side 1              ; save data
+    jmp pin, msg_done       side 0              ; check start/stop bit, jump if no more data
 .wrap                                           ; use wrap instead of jump
 ;   jmp rx_word_loop        side 0              ; loop around for next word
 

@@ -170,7 +170,7 @@ void print_buffer(p3n_buffer_t *buf)
 {
     int len;
 
-    printf("buf: %p max_len: %d  data_len: %d  data: %p\n", buf, buf->max_len, buf->data_len, buf->data);
+    printf("buf: %p max_len: %d  data_len: %d  data: %p", buf, buf->max_len, buf->data_len, buf->data);
     len = buf->data_len;
     if ( len > buf->max_len ) {
         len = buf->max_len;
@@ -597,6 +597,10 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
         // channel busy
         return false;
     }
+    if ( ( rx_pin == P3N_NO_PIN ) && ( tx_pin == P3N_NO_PIN ) ) {
+        // whats the point?
+        return false;
+    }
     // stop the state machine and any DMA
     pio_sm_set_enabled(p3n_pio, ch->sm_index, false);
     dma_channel_abort(ch->dma_index);
@@ -626,9 +630,9 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
         sm_config_set_in_pins(&c, rx_pin);
         sm_config_set_jmp_pin(&c, rx_pin);
     } else {
-        // default mapping if no receive pin
-        sm_config_set_in_pins(&c, 0);
-        sm_config_set_jmp_pin(&c, 0);
+        // no receive pin, map to transmit pin
+        sm_config_set_in_pins(&c, tx_pin);
+        sm_config_set_jmp_pin(&c, tx_pin);
     }
     if ( tx_pin != P3N_NO_PIN ) {
         // enable pull up on the transmit pin (it might be bidirectional)
@@ -667,7 +671,7 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
     sm_config_set_clkdiv(&c, (float)div);
 
     // Load our configuration, and jump to the start of the program (but don't run)
-    pio_sm_init(p3n_pio, ch->sm_index, p3n_code_offset+p3n_rxtx_offset_cmd_start, &c);
+    pio_sm_init(p3n_pio, ch->sm_index, p3n_code_offset+p3n_rxtx_offset_p3n_entry, &c);
     // set initial state and direction of the tx and tx_ena pins
     pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_mov(pio_osr, pio_null));
     pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_out(pio_pindirs, 1));
@@ -714,23 +718,28 @@ void p3n_test(void)
     rb = p3n_configure_chan(1, 9, P3N_NO_PIN, P3N_NO_PIN, BITRATE);
     assert(rb);
 
-    copy_string_to_buffer(buffers[0], "bus1, using buffers[0]");
-    erase_buffer(buffers[1]);
-    print_buffer(buffers[0]);
-    print_buffer(buffers[1]);
-    printf("start receive\n");
-    p3n_receive(1, buffers[1], 0);
-    printf("receive state = %d\n", p3n_chans[1].state);
-    printf("start transmit\n");
-    p3n_transmit(0, buffers[0], 0);
-    printf("transmit state = %d\n", p3n_chans[0].state);
-    while ( p3n_chans[0].state != CHAN_ST_IDLE );
-    printf("transmitter state is now idle\n");
-    printf("receive state = %d\n", p3n_chans[1].state);
-    print_buffer(buffers[0]);
-    print_buffer(buffers[1]);
+    while(1) {
+
+        copy_string_to_buffer(buffers[0], "hi!");
+        erase_buffer(buffers[1]);
+        print_buffer(buffers[0]);
+        print_buffer(buffers[1]);
+        printf("start receive\n");
+        gpio_put(SCOPE_CHAN_1, 1);
+        p3n_receive(1, buffers[1], 10);
+//        printf("receive state = %d\n", p3n_chans[1].state);
+//        printf("start transmit\n");
+        p3n_transmit(0, buffers[0], 15);
+//        printf("transmit state = %d\n", p3n_chans[0].state);
+        while ( p3n_chans[0].state != CHAN_ST_IDLE );
+        gpio_put(SCOPE_CHAN_1, 0);
+        printf("transmitter state is now idle\n");
+        printf("receive state = %d\n", p3n_chans[1].state);
+        print_buffer(buffers[0]);
+        print_buffer(buffers[1]);
+        delay_ms(5000);
     
-    while(1);
+    };
 
 
 #if (TESTMODE == TX )
