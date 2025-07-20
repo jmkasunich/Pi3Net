@@ -33,7 +33,6 @@
 
 tx_start:
     set pins 1              side 0              ; enable external transmitter, if any
-; might be able to remove this instruction, if I set the MSB of the command to 1
     mov osr, ~null          side 0              ; put 1's in osr
     out pindirs, 1          side 0              ; make the data pin an output
     pull block      		side 0              ; get first data word (stall if none)
