@@ -50,9 +50,9 @@ tx_bit_loop:
     set pins 0              side 0              ; disable external transmitter, if any
 msg_done:
     irq nowait 0 rel        side 1              ; tell the MCU that we are done
-post_cmd_delay:
+PUBLIC post_cmd_delay:
     jmp y--, post_cmd_delay side 0  [(cpb-1)]   ; wait y bit times before next command
-PUBLIC p3n_entry:
+PUBLIC entry:
     pull block              side 1              ; get command into OSR, stall if none
     out y, (sdb)            side 1              ; get silence delay
     mov x, y                side 1              ; init silence timer
@@ -65,7 +65,7 @@ start_cmd:
     out x, (cb)             side 1              ; get command to x
     out y, (pdb)            side 1              ; save post-command delay for later in y
     jmp !x, tx_start        side 1              ; start the appropriate command
-rx_start:
+PUBLIC rx_wait_4_low:
     wait 0 pin 0            side 0              ; find falling edge of 1st start pulse
 rx_word_loop:
 .wrap_target

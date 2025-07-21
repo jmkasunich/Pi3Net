@@ -3,10 +3,8 @@
 #include "pico/stdlib.h"
 #include "pi3net.h"
 #include "pi3net.pio.h"
-#include "hardware/structs/systick.h"
-#include "hardware/structs/pio.h"
-#include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "hardware/sync.h"
 
 // bits/word and clocks/bit are set in pi3net.pio
 // and thus come in via pi3net.pio.h
@@ -22,52 +20,61 @@
 
 #define BYTES_PER_WORD  (p3n_bits_per_word/8u)
 
-// testing stuff
+#define COMMAND_SHIFT           (p3n_silence_delay_bits)
+#define POST_CMD_DELAY_SHIFT    (p3n_silence_delay_bits+p3n_command_bits)
 
-#define SCOPE_CHAN_1  (10)
-#define SCOPE_CHAN_2  (14)
-#define SCOPE_CHAN_3  (6)
-#define SCOPE_CHAN_4  (8)
-#define SCOPE_CHAN_5  (12)
+#define MAX_SILENCE_DELAY       ((1<<(p3n_silence_delay_bits))-1)
+#define MAX_POST_CMD_DELAY      ((1<<(p3n_post_cmd_delay_bits))-1)
 
-#define BITRATE 100000
+#define SILENCE_DELAY_RX        ((p3n_clocks_per_bit*((p3n_bits_per_word)+3))/2)
+#define SILENCE_DELAY_TX        ((p3n_clocks_per_bit*((p3n_bits_per_word)+5))/2)
 
-#define TX 1
-#define RX 2
-#define NONE 0
-#define TESTMODE NONE
+static_assert(MAX_SILENCE_DELAY > SILENCE_DELAY_RX);
+static_assert(MAX_SILENCE_DELAY > SILENCE_DELAY_TX);
+
+#define PIO_CMD_RX              ((1<<(COMMAND_SHIFT))|(SILENCE_DELAY_RX))
+#define PIO_CMD_TX              ((0<<(COMMAND_SHIFT))|(SILENCE_DELAY_TX))
+#define PIO_CMD_MASK            ((1<<(COMMAND_SHIFT+1))-1)
+
+
+#define P3N_ERR_BAD_CHAN    (-1)
+#define P3N_ERR_BAD_BUFFER  (-2)
+#define P3N_ERR_BAD_DELAY   (-3)
+#define P3N_ERR_BAD_PIN     (-4)
+#define P3N_ERR_CHAN_UNINIT (-5)
+#define P3N_ERR_QUEUE_FULL  (-6)
+#define P3N_ERR_BAD_INDEX   (-7)
+
+
+/**********************************************************
+ * This structure defines a pi3net command.
+ */
+typedef struct p3n_cmd_s {
+    p3n_cmd_state_t      state;
+    uint32_t             pio_cmd;
+    p3n_buffer_t        *buf;
+} p3n_cmd_t;
+
+static_assert(sizeof(p3n_cmd_t) == 12 );
 
 
 /**********************************************************
  * This structure defines a pi3net channel.
  */
-typedef enum {
-    CHAN_ST_UNINIT = 0,
-    CHAN_ST_IDLE,
-    CHAN_ST_TX,
-    CHAN_ST_RX,
-    MAXCHANST
-} p3n_chan_state_t;
-
-#define CHAN_STATE_BITS   (BITS2STORE(MAXCHANST))
-#define SM_INDEX_BITS     ((BITS2STORE(NUM_PIO_STATE_MACHINES)))
-#define DMA_INDEX_BITS    ((BITS2STORE(NUM_DMA_CHANNELS)))
-
 typedef struct p3n_chan_s {
-    p3n_chan_state_t            state       : CHAN_STATE_BITS;
-    uint32_t                    sm_index    : SM_INDEX_BITS;
-    uint32_t                    dma_index   : DMA_INDEX_BITS;
-    uint32_t                    rx_pin      : P3N_PIN_BITS;
-    uint32_t                    tx_pin      : P3N_PIN_BITS;
-    uint32_t                    tx_ena_pin  : P3N_PIN_BITS;
-    dma_channel_config          rx_dma_config;
-    dma_channel_config          tx_dma_config;
-    struct p3n_buffer_s        *buf;
-    struct p3n_cmd_s           *cmd;
+    uint8_t                   sm_index;
+    uint8_t                   dma_index;
+    uint8_t                   rx_pin;
+    uint8_t                   tx_pin;
+    uint8_t                   tx_ena_pin;
+    uint8_t                   queue_len;
+    uint8_t                   queue_in;
+    uint8_t                   queue_out;
+    dma_channel_config        rx_dma_config;
+    dma_channel_config        tx_dma_config;
+    p3n_cmd_t                *active_cmd;
+    p3n_cmd_t                *cmd_queue;
 } p3n_chan_t;
-
-static_assert((CHAN_STATE_BITS + SM_INDEX_BITS + DMA_INDEX_BITS + 3*P3N_PIN_BITS) <= 32);
-static_assert(sizeof(p3n_chan_t) == 20 );
 
 /*************************************************
  * Global data - initialized by p3n_init()
@@ -81,66 +88,9 @@ static uint p3n_crc_dma_index = NUM_DMA_CHANNELS;
 static uint32_t crc_dummy;
 static p3n_chan_t p3n_chans[P3N_NUM_CHAN];
 
-/*************************************************
- * Port data - normally provided by application
- */
+static void chan_start_next_cmd(p3n_chan_t *ch);
+static bool try_pio(uint index);
 
-const p3n_port_t bus1  = { 16, 16, 17 };
-const p3n_port_t bus2  = { 22, 22, 28 };
-const p3n_port_t up = { 5, 4, P3N_NO_PIN };
-const p3n_port_t dn = { 3, 2, P3N_NO_PIN };
-
-
-
-// FIXME - this code should live somewhere else
-// I'm astonished that the SDK doesn't have a proper busywait
-
-void delay_clks(uint32_t clks)
-{
-    uint32_t start, now, dt;
-
-    // systick rolls over at 2^24 = 134ms
-    // only an idiot busywaits that long
-    // clamp it at 100ms
-    if ( clks > 12500000 ) {
-        clks = 12500000;
-    }
-    // it takes about 25 clocks to run this code when clks = 0
-    if ( clks > 25 ) {
-        clks -= 25;
-    } else {
-        clks = 0;
-    }
-    start = systick_hw->cvr;
-    do {
-        now = systick_hw->cvr;
-        dt = (start - now) & 0x00FFFFFF;
-    } while ( dt < clks );
-}
-
-void delay_us(uint32_t us)
-{
-    // systick rolls over at 2^24 = 134ms
-    // only an idiot busywaits that long
-    // clamp it at 100ms
-    if ( us > 100000 ) {
-        us = 100000;
-    }
-    if ( us == 0 ) {
-        return;
-    }
-    // subtract 26 clocks for call overhead
-    delay_clks(us*125-26);
-}
-
-void delay_ms(uint32_t ms)
-{
-    // sometimes I'm an idiot and do long busywaits
-    while ( ms > 0 ) {
-        delay_us(1000);
-        ms--;
-    }
-}
 
 p3n_buffer_t *p3n_buffer_new(uint16_t max_msg_len_bytes)
 {
@@ -251,10 +201,10 @@ static uint32_t crc32_result(void)
 void p3n_buffer_add_crc32(p3n_buffer_t *buf)
 {
     // if data is not a multiple of 4 bytes, pad it with zeros
-    while ( buf->data_len & ~3 ) {
+    while ( buf->data_len & ~3u ) {
         buf->data[buf->data_len++] = 0;
     }
-    crc32_start((uint32_t *)buf->data, buf->data_len >>2);
+    crc32_start((uint32_t *)buf->data, (buf->data_len >> 2));
     // append CRC to data
     *(uint32_t *)&(buf->data[buf->data_len]) = crc32_result();
 }
@@ -275,48 +225,41 @@ bool p3n_buffer_check_crc32(p3n_buffer_t *buf)
     return false;
 }
 
+#define SCOPE_CHAN_1  (10)
 
-void p3n_chan_irq_handler(p3n_chan_t *ch)
+
+void __time_critical_func(p3n_chan_irq_handler)(p3n_chan_t *ch)
 {
-    switch ( ch->state ) {
-        case CHAN_ST_RX:
-            // stop the DMA
-            dma_channel_abort(ch->dma_index);
-            // capture last DMA address
-            char *addr = (char *) dma_channel_hw_addr(ch->dma_index)->write_addr;
-            // received a message, figure out how long it is
-            ch->buf->data_len = (uint16_t)(addr - ch->buf->data);
-            ch->state = CHAN_ST_IDLE;
-            break;
-        case CHAN_ST_TX:
-            // stop the DMA
-            dma_channel_abort(ch->dma_index);
-            ch->state = CHAN_ST_IDLE;
-            break;
-        case CHAN_ST_UNINIT:
-            // should never get an interrupt while in uninitialized
-            break;
-        case CHAN_ST_IDLE:
-            // should never get an interrupt while in idle
-            break;
-        default:
-            break;
-    }
-}
+    p3n_cmd_t *cmd;
 
-uint irq_count = 0;
+    gpio_put(SCOPE_CHAN_1, 1);
+    cmd = ch->active_cmd;
+    if ( cmd != NULL ) {
+        if (( cmd->pio_cmd & PIO_CMD_MASK ) == PIO_CMD_RX ) {
+            // previous command was receive
+            dma_channel_abort(ch->dma_index);
+            // capture last DMA address and compute message length
+            char *addr = (char *) dma_channel_hw_addr(ch->dma_index)->write_addr;
+            cmd->buf->data_len = (uint16_t)(addr - cmd->buf->data);
+        } else {
+            // previous command was transmit
+            dma_channel_abort(ch->dma_index);
+        }
+        cmd->state = P3N_CMD_ST_DONE;
+        ch->active_cmd = NULL;
+    }
+    chan_start_next_cmd(ch);
+    gpio_put(SCOPE_CHAN_1, 0);
+}
 
 /*********************************************************
  * This IRQ handler is a dispatcher; it calls a channel
  * handler for any channel(s) that need serviced.
   */
-void p3n_pio_irq_handler(void)
+void __time_critical_func(p3n_pio_irq_handler)(void)
 {
     p3n_chan_t *ch;
 
-    irq_count++;
-    // FIXME - remove print after testing
-    printf("i%d", irq_count);
     for ( int n = 0 ; n < P3N_NUM_CHAN ; n++ ) {
         ch = &(p3n_chans[n]);
         if ( pio_interrupt_get(p3n_pio, ch->sm_index) ) {
@@ -326,8 +269,6 @@ void p3n_pio_irq_handler(void)
     }
 }
 
-
-static bool try_pio(uint index);
 
 bool p3n_init(void)
 {
@@ -358,7 +299,7 @@ bool p3n_init(void)
             printf("insufficient DMA resources\n");
             return false;
         }
-        ch->dma_index = (uint)rv & ((1<<DMA_INDEX_BITS)-1);
+        ch->dma_index = (uint8_t)rv;
     }
     // we do CRC calculations by dma'ing the data to
     // a dummy address with the sniffer enabled
@@ -438,7 +379,7 @@ static bool try_pio(uint index)
             printf("couldn't reserve state machines\n");
             return false;
         }
-        p3n_chans[n].sm_index = (uint)rv & ((1<<SM_INDEX_BITS)-1);
+        p3n_chans[n].sm_index = (uint8_t)rv;
     }
     return true;
 }
@@ -447,11 +388,14 @@ static void chan_reset(p3n_chan_t *ch)
 {
     ch->sm_index = NUM_PIO_STATE_MACHINES;
     ch->dma_index = NUM_DMA_CHANNELS;
-    ch->state = CHAN_ST_UNINIT;
     ch->rx_pin = P3N_NO_PIN;
     ch->tx_pin = P3N_NO_PIN;
     ch->tx_ena_pin = P3N_NO_PIN;
-    ch->buf = NULL;
+    ch->queue_len = 0;
+    ch->queue_in = 0;
+    ch->queue_out = 0;
+    ch->cmd_queue = NULL;
+    ch->active_cmd = NULL;
 }
 
 void p3n_uninit(void)
@@ -480,18 +424,27 @@ void p3n_uninit(void)
             dma_channel_unclaim(ch->dma_index);
             ch->dma_index = NUM_DMA_CHANNELS;
         }
+        if ( ch->rx_pin != P3N_NO_PIN ) {
+            gpio_deinit(ch->rx_pin);
+        }
+        if ( ch->tx_pin != P3N_NO_PIN ) {
+            gpio_deinit(ch->tx_pin);
+        }
+        if ( ch->tx_ena_pin != P3N_NO_PIN ) {
+            gpio_deinit(ch->tx_ena_pin);
+        }
+        if ( ch->cmd_queue != NULL ) {
+            free(ch->cmd_queue);
+        }
         chan_reset(ch);
     }
     // now release global resources
-    // disable interrupt and remove handler
     irq_set_enabled(p3n_irq_num, false);
     irq_remove_handler(p3n_irq_num, p3n_pio_irq_handler);
-    // unload the PIO program
     if ( p3n_code_offset != PIO_INSTRUCTION_COUNT ) {
         pio_remove_program(p3n_pio, &p3n_rxtx_program, p3n_code_offset);
         p3n_code_offset = PIO_INSTRUCTION_COUNT;
     }
-    // free up the CRC calculation DMA channel
     if ( p3n_crc_dma_index != NUM_DMA_CHANNELS ) {
         dma_channel_abort(p3n_crc_dma_index);
         dma_channel_unclaim(p3n_crc_dma_index);
@@ -501,113 +454,276 @@ void p3n_uninit(void)
     p3n_pio = NULL;
 }
 
-#define MAX_SILENCE_DELAY       ((1<<(p3n_silence_delay_bits))-1)
-#define MAX_POST_CMD_DELAY      ((1<<(p3n_post_cmd_delay_bits))-1)
-#define COMMAND_SHIFT           (p3n_silence_delay_bits)
-#define POST_CMD_DELAY_SHIFT    (COMMAND_SHIFT+(p3n_command_bits))
-#define PIO_CMD_RX              (1<<(COMMAND_SHIFT))
-#define PIO_CMD_TX              (0<<(COMMAND_SHIFT))
-#define SILENCE_DELAY_RX        ((p3n_clocks_per_bit*((p3n_bits_per_word)+3))/2)
-#define SILENCE_DELAY_TX        ((p3n_clocks_per_bit*((p3n_bits_per_word)+5))/2)
+static void __time_critical_func(chan_start_next_cmd)(p3n_chan_t *ch)
+{
+    uint8_t index;
+    p3n_cmd_t *cmd;
 
-static_assert(MAX_SILENCE_DELAY > SILENCE_DELAY_RX);
-static_assert(MAX_SILENCE_DELAY > SILENCE_DELAY_TX);
+    index = ch->queue_out;
+    cmd = &(ch->cmd_queue[index]);
+    if ( cmd->state != P3N_CMD_ST_QUEUED ) {
+        // nothing to do
+        ch->active_cmd = NULL;
+        return;
+    }
+    if ( ( cmd->pio_cmd & PIO_CMD_MASK ) == PIO_CMD_RX ) {
+        // receive command
+        // start the DMA transfer
+        dma_channel_configure(ch->dma_index, &ch->rx_dma_config, cmd->buf->data,
+                                ((char *)&(p3n_pio->rxf[ch->sm_index]))+(4-BYTES_PER_WORD),
+                                cmd->buf->max_len / BYTES_PER_WORD, true);
+        // send command to the PIO
+        pio_sm_put(p3n_pio, ch->sm_index, cmd->pio_cmd);
+    } else {
+        // transmit command
+        // send command to the PIO
+        pio_sm_put(p3n_pio, ch->sm_index, cmd->pio_cmd);
+        // start the DMA transfer (data must follow command)
+        dma_channel_configure(ch->dma_index, &ch->tx_dma_config,
+                                &(p3n_pio->txf[ch->sm_index]), cmd->buf->data,
+                                (cmd->buf->data_len+(BYTES_PER_WORD-1))/BYTES_PER_WORD, true);
+    }
+    ch->active_cmd = cmd;
+    cmd->state = P3N_CMD_ST_ACTIVE;
+    // decrement queue pointer; point to next entry
+    if ( index > 0 ) {
+        ch->queue_out = index - 1;
+    } else {
+        ch->queue_out = ch->queue_len - 1;
+    }
+}
 
-bool p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t delay)
+static int queue_cmd(p3n_chan_t *ch, p3n_buffer_t *buf, uint32_t delay, uint32_t pio_cmd)
+{
+    uint32_t save;
+    uint8_t index;
+    p3n_cmd_t *cmd;
+
+    // validate inputs
+    if ( delay > MAX_POST_CMD_DELAY ) return P3N_ERR_BAD_DELAY;
+    if ( ch->cmd_queue == NULL ) return P3N_ERR_CHAN_UNINIT;
+    // start atomic region
+    save = save_and_disable_interrupts();
+    index = ch->queue_in;
+    cmd = &(ch->cmd_queue[index]);
+    if ( cmd->state != P3N_CMD_ST_AVAIL ) {
+        restore_interrupts_from_disabled(save);
+        return P3N_ERR_QUEUE_FULL;
+    }
+    cmd->state = P3N_CMD_ST_QUEUED;
+    cmd->buf = buf;
+    cmd->pio_cmd = (delay << (POST_CMD_DELAY_SHIFT)) | pio_cmd;
+    // decrement queue pointer
+    if ( index > 0 ) {
+        ch->queue_in = index - 1;
+    } else {
+        ch->queue_in = ch->queue_len - 1;
+    }
+    restore_interrupts_from_disabled(save);
+    if ( ch->active_cmd == NULL ) {
+        chan_start_next_cmd(ch);
+    }
+    return index;
+}
+
+int p3n_queue_receive_cmd(uint ch_num, p3n_buffer_t *buf, uint32_t delay)
 {
     p3n_chan_t *ch;
-    uint32_t pio_cmd;
 
-    assert(ch_num < P3N_NUM_CHAN);
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_ERR_BAD_CHAN;
     ch = &(p3n_chans[ch_num]);
-    if ( ch->rx_pin == P3N_NO_PIN ) {
-        printf("can't receive\n");
-        return false;
-    }
-    if ( ( buf == NULL ) || ( buf->max_len == 0 ) || ( buf->data_len != 0 ) ) {
-        printf("bad buf\n");
-        return false;
-    }
-    if ( delay > MAX_POST_CMD_DELAY ) {
-        printf("delay too long; shortened\n");
-        delay = MAX_POST_CMD_DELAY;
-    }
-    // FIXME - probably want some form of atomic operation here....
-    if ( ch->state != CHAN_ST_IDLE ) {
-        printf("status\n");
-        return false;
-    }
-    // save the buffer
-    ch->buf = buf;
-    // start the DMA transfer
-    dma_channel_configure(ch->dma_index, &ch->rx_dma_config, ch->buf->data,
-                            ((char *)&(p3n_pio->rxf[ch->sm_index]))+(4-BYTES_PER_WORD),
-                             ch->buf->max_len / BYTES_PER_WORD, true);
-    // send command to the PIO
-    pio_cmd = (delay << (POST_CMD_DELAY_SHIFT)) | PIO_CMD_RX | SILENCE_DELAY_RX;
-    pio_sm_put(p3n_pio, ch->sm_index, pio_cmd);
-    ch->state = CHAN_ST_RX;
+    if ( ch->rx_pin == P3N_NO_PIN ) return P3N_ERR_BAD_PIN;
+    if ( buf == NULL ) return P3N_ERR_BAD_BUFFER;
+    if ( buf->data_len > 0 ) return P3N_ERR_BAD_BUFFER;
+    if ( buf->max_len < 4 ) return P3N_ERR_BAD_BUFFER;
+    return queue_cmd(ch, buf, delay, PIO_CMD_RX);
+}
+
+int p3n_queue_transmit_cmd(uint ch_num, p3n_buffer_t *buf, uint32_t delay)
+{
+    p3n_chan_t *ch;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_ERR_BAD_CHAN;
+    ch = &(p3n_chans[ch_num]);
+    if ( ch->tx_pin == P3N_NO_PIN ) return P3N_ERR_BAD_PIN;
+    if ( buf == NULL ) return P3N_ERR_BAD_BUFFER;
+    if ( buf->data_len == 0 ) return P3N_ERR_BAD_BUFFER;
+    return queue_cmd(ch, buf, delay, PIO_CMD_TX);
+}
+
+p3n_cmd_state_t p3n_get_cmd_state(uint ch_num, int cmd_index)
+{
+    p3n_chan_t *ch;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_CMD_ST_ERROR;
+    if ( cmd_index < 0 ) return P3N_CMD_ST_ERROR;
+    ch = &(p3n_chans[ch_num]);
+    if ( cmd_index >= ch->queue_len ) return P3N_CMD_ST_ERROR;
+    return ch->cmd_queue[cmd_index].state;
+}
+
+p3n_buffer_t *p3n_get_cmd_buffer(uint ch_num, int cmd_index)
+{
+    p3n_chan_t *ch;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return NULL;
+    if ( cmd_index < 0 ) return NULL;
+    ch = &(p3n_chans[ch_num]);
+    if ( cmd_index >= ch->queue_len ) return NULL;
+    return ch->cmd_queue[cmd_index].buf;
+}
+
+bool p3n_cmd_release(uint ch_num, int cmd_index)
+{
+    p3n_chan_t *ch;
+    p3n_cmd_t *cmd;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return false;
+    if ( cmd_index < 0 ) return false;
+    ch = &(p3n_chans[ch_num]);
+    if ( cmd_index >= ch->queue_len ) return false;
+    cmd = &(ch->cmd_queue[cmd_index]);
+    if ( cmd->state != P3N_CMD_ST_DONE ) return false;
+    cmd->state = P3N_CMD_ST_AVAIL;
     return true;
 }
 
-bool p3n_transmit(uint ch_num, p3n_buffer_t *buf, uint32_t delay)
+void p3n_channel_rx_abort(uint ch_num)
 {
     p3n_chan_t *ch;
-    uint32_t pio_cmd;
+    uint pc;
 
-    assert(ch_num < P3N_NUM_CHAN);
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return;
     ch = &(p3n_chans[ch_num]);
-    if ( ch->tx_pin == P3N_NO_PIN ) {
-        printf("can't transmit\n");
-        return false;
+    pc = pio_sm_get_pc(p3n_pio, ch->sm_index);
+    if ( (pc - p3n_code_offset) == p3n_rxtx_offset_rx_wait_4_low ) {
+        // generate the end-of-message interrupt
+        pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_irq_set(true, 0));
+        // then skip the delay and go right to the entry point for next command
+        pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_jmp(p3n_code_offset+p3n_rxtx_offset_entry));
     }
-    if ( ( buf == NULL ) || ( buf->data_len == 0 ) ) {
-        printf("bad buf\n");
-        return false;
-    }
-    if ( delay > MAX_POST_CMD_DELAY ) {
-        printf("delay too long; shortened\n");
-        delay = MAX_POST_CMD_DELAY;
-    }
-    // FIXME - probably want some form of atomic operation here....
-    if ( ch->state != CHAN_ST_IDLE ) {
-        printf("status\n");
-        return false;
-    }
-    // save the buffer
-    ch->buf = buf;
-    // send command to the PIO
-    pio_cmd = (delay << (POST_CMD_DELAY_SHIFT)) | PIO_CMD_TX | SILENCE_DELAY_TX;
-    pio_sm_put(p3n_pio, ch->sm_index, pio_cmd);
-    // start the DMA transfer (data must follow command)
-    dma_channel_configure(ch->dma_index, &ch->tx_dma_config, &(p3n_pio->txf[ch->sm_index]),
-                             ch->buf->data, (ch->buf->data_len+(BYTES_PER_WORD-1))/BYTES_PER_WORD, true);
-    ch->state = CHAN_ST_TX;
-    return true;
 }
 
-bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, uint bitrate)
+void p3n_channel_delay_abort(uint ch_num)
 {
     p3n_chan_t *ch;
+    uint pc;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return;
+    ch = &(p3n_chans[ch_num]);
+    pc = pio_sm_get_pc(p3n_pio, ch->sm_index);
+    if ( (pc - p3n_code_offset) == p3n_rxtx_offset_post_cmd_delay ) {
+        pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_jmp(p3n_code_offset+p3n_rxtx_offset_entry));
+    }
+}
+
+void p3n_channel_full_abort(uint ch_num)
+{
+    p3n_chan_t *ch;
+    p3n_cmd_t *cmd;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return;
+    ch = &(p3n_chans[ch_num]);
+    if ( ch->cmd_queue == NULL ) return;
+    // ensure that an IRQ won't start another command
+    ch->cmd_queue[0].state = P3N_CMD_ST_AVAIL;
+    ch->queue_out = 0;
+    // stop the PIO state machine and the DMA
+    pio_sm_set_enabled(p3n_pio, ch->sm_index, false);
+    dma_channel_abort(ch->dma_index);
+    // set initial state and direction of the tx and tx_ena pins
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_mov(pio_osr, pio_null));
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_out(pio_pindirs, 1));
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_mov_not(pio_osr, pio_null));
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_out(pio_pins, 1));
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_set(pio_pins, 0));
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_set(pio_pindirs, 1));
+    // flush fifos
+    pio_sm_drain_tx_fifo(p3n_pio, ch->sm_index);
+    while( ! pio_sm_is_rx_fifo_empty(p3n_pio, ch->sm_index) ) {
+        pio_sm_get(p3n_pio, ch->sm_index);
+    }
+    // flush command queue
+    for ( int n = 0 ; n < ch->queue_len ; n++ ) {
+        cmd = &(ch->cmd_queue[n]);
+        cmd->state = P3N_CMD_ST_AVAIL;
+        cmd->buf = NULL;
+    }
+    ch->queue_in = 0;
+    ch->queue_out = 0;
+    // mark channel idle
+    ch->active_cmd = NULL;
+    // restart the state machine
+    pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_jmp(p3n_code_offset+p3n_rxtx_offset_entry));
+    pio_sm_set_enabled(p3n_pio, ch->sm_index, true);
+}
+
+bool p3n_configure_chan(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len)
+{
+    p3n_chan_t *ch;
+    p3n_cmd_t *cmd;
     pio_sm_config c;
 
     assert(ch_num < P3N_NUM_CHAN);
+    assert(queue_len > 1 );
     ch = &(p3n_chans[ch_num]);
-    if ( ( ch->state == CHAN_ST_RX ) || ( ch->state == CHAN_ST_TX ) ) {
+    if ( ch->active_cmd != NULL ) {
         // channel busy
         return false;
     }
-    if ( ( rx_pin == P3N_NO_PIN ) && ( tx_pin == P3N_NO_PIN ) ) {
-        // whats the point?
+    if ( ( port->rx_pin == P3N_NO_PIN ) && ( port->tx_pin == P3N_NO_PIN ) ) {
+        // whats the point if you can neither send nor receive?
         return false;
     }
     // stop the state machine and any DMA
     pio_sm_set_enabled(p3n_pio, ch->sm_index, false);
     dma_channel_abort(ch->dma_index);
+    // unmap any previously used pins
+    if ( ch->rx_pin != P3N_NO_PIN ) {
+        gpio_deinit(ch->rx_pin);
+        ch->rx_pin = P3N_NO_PIN;
+    }
+    if ( ch->tx_pin != P3N_NO_PIN ) {
+        gpio_deinit(ch->tx_pin);
+        ch->tx_pin = P3N_NO_PIN;
+    }
+    if ( ch->tx_ena_pin != P3N_NO_PIN ) {
+        gpio_deinit(ch->tx_ena_pin);
+        ch->tx_ena_pin = P3N_NO_PIN;
+    }
+    // allocate space for command queue
+    if ( ch->queue_len != queue_len ) {
+        if ( ch->cmd_queue != NULL ) {
+            free(ch->cmd_queue);
+            ch->queue_len = 0;
+        }
+        ch->cmd_queue = malloc(queue_len*sizeof(p3n_cmd_t));
+        if ( ch->cmd_queue == NULL ) {
+            // no memory for queue
+            return false;
+        }
+        ch->queue_len = queue_len;
+    }
+    // intialize command queue
+    ch->queue_in = 0;
+    ch->queue_out = 0;
+    for ( uint n = 0 ; n < ch->queue_len ; n++ ) {
+        cmd = &(ch->cmd_queue[n]);
+        cmd->state = P3N_CMD_ST_AVAIL;
+        cmd->buf = NULL;
+    }
     // store new pin mapping
-    ch->rx_pin = rx_pin & ((1<<P3N_PIN_BITS)-1);
-    ch->tx_pin = tx_pin & ((1<<P3N_PIN_BITS)-1);
-    ch->tx_ena_pin = tx_ena_pin & ((1<<P3N_PIN_BITS)-1);
+    ch->rx_pin = port->rx_pin;
+    ch->tx_pin = port->tx_pin;
+    ch->tx_ena_pin = port->tx_ena_pin;
     // prepare DMA configurations for RX and TX
     ch->rx_dma_config = dma_channel_get_default_config(ch->dma_index);
     channel_config_set_read_increment(&ch->rx_dma_config, false);
@@ -621,38 +737,38 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
     channel_config_set_transfer_data_size(&ch->tx_dma_config, DMA_SIZE);
     // prepare PIO configuration
     c = p3n_rxtx_program_get_default_config(p3n_code_offset);
-    if ( rx_pin != P3N_NO_PIN ) {
+    if ( ch->rx_pin != P3N_NO_PIN ) {
         // enable pull up on the receive pin (it might be bidirectional)
-        gpio_pull_up(rx_pin);
+        gpio_pull_up(ch->rx_pin);
         // set pad mux so PIO gets its value from the pin
-        pio_gpio_init(p3n_pio, rx_pin);
+        pio_gpio_init(p3n_pio, ch->rx_pin);
         // set up the "in" and "jmp" pin mapping
-        sm_config_set_in_pins(&c, rx_pin);
-        sm_config_set_jmp_pin(&c, rx_pin);
+        sm_config_set_in_pins(&c, ch->rx_pin);
+        sm_config_set_jmp_pin(&c, ch->rx_pin);
     } else {
         // no receive pin, map to transmit pin
-        sm_config_set_in_pins(&c, tx_pin);
-        sm_config_set_jmp_pin(&c, tx_pin);
+        sm_config_set_in_pins(&c, ch->tx_pin);
+        sm_config_set_jmp_pin(&c, ch->tx_pin);
     }
-    if ( tx_pin != P3N_NO_PIN ) {
+    if ( ch->tx_pin != P3N_NO_PIN ) {
         // enable pull up on the transmit pin (it might be bidirectional)
-        gpio_pull_up(tx_pin);
+        gpio_pull_up(ch->tx_pin);
         // set pad mux so pin gets its value from PIO
-        pio_gpio_init(p3n_pio, tx_pin);
+        pio_gpio_init(p3n_pio, ch->tx_pin);
         // set up the "out" pin mapping
-        sm_config_set_out_pins(&c, tx_pin, 1);
+        sm_config_set_out_pins(&c, ch->tx_pin, 1);
     } else {
         // if no transmit pin, "out" mapping has zero pins
         sm_config_set_out_pins(&c, 0, 0);
     }
     // tx_ena uses the "set" pin mapping
-    if ( tx_ena_pin != P3N_NO_PIN ) {
+    if ( ch->tx_ena_pin != P3N_NO_PIN ) {
         // enable pull down on the transmit enable pin (don't transmit)
-        gpio_pull_down(tx_ena_pin);
+        gpio_pull_down(ch->tx_ena_pin);
         // set pad mux so pin gets its value from PIO
-        pio_gpio_init(p3n_pio, tx_ena_pin);
+        pio_gpio_init(p3n_pio, ch->tx_ena_pin);
         // set up the "set" pin mapping
-        sm_config_set_set_pins(&c, tx_ena_pin, 1);
+        sm_config_set_set_pins(&c, ch->tx_ena_pin, 1);
     } else {
         // if no transmit enable pin, "set" mapping has zero pins
         sm_config_set_set_pins(&c, 0, 0);
@@ -671,7 +787,7 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
     sm_config_set_clkdiv(&c, (float)div);
 
     // Load our configuration, and jump to the start of the program (but don't run)
-    pio_sm_init(p3n_pio, ch->sm_index, p3n_code_offset+p3n_rxtx_offset_p3n_entry, &c);
+    pio_sm_init(p3n_pio, ch->sm_index, p3n_code_offset+p3n_rxtx_offset_entry, &c);
     // set initial state and direction of the tx and tx_ena pins
     pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_mov(pio_osr, pio_null));
     pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_out(pio_pindirs, 1));
@@ -681,14 +797,95 @@ bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, 
     pio_sm_exec(p3n_pio, ch->sm_index, pio_encode_set(pio_pindirs, 1));
     // Set the state machine running
     pio_sm_set_enabled(p3n_pio, ch->sm_index, true);
-    ch->state = CHAN_ST_IDLE;
     return true;
 }
 
 
+/*************************************************
+ * Port data - normally provided by application
+ */
 
+const p3n_port_t port_bus1  = { 16, 16, 17 };
+const p3n_port_t port_bus2  = { 22, 22, 28 };
+const p3n_port_t port_up = { 5, 4, P3N_NO_PIN };
+const p3n_port_t port_dn = { 3, 2, P3N_NO_PIN };
+const p3n_port_t port_rx = { 9, P3N_NO_PIN, P3N_NO_PIN };
+const p3n_port_t port_tx = { P3N_NO_PIN, 9, P3N_NO_PIN };
+
+// testing stuff
+
+#define SCOPE_CHAN_1  (10)
+#define SCOPE_CHAN_2  (14)
+#define SCOPE_CHAN_3  (6)
+#define SCOPE_CHAN_4  (8)
+#define SCOPE_CHAN_5  (12)
+
+#define BITRATE 5000000
+
+#define TX 1
+#define RX 2
+#define NONE 0
+#define TESTMODE NONE
 
 #define NUM_BUFFERS 6
+
+
+
+// FIXME - this code should live somewhere else
+// I'm astonished that the SDK doesn't have a proper busywait
+
+#include "hardware/structs/systick.h"
+
+
+void delay_clks(uint32_t clks)
+{
+    uint32_t start, now, dt;
+
+    // systick rolls over at 2^24 = 134ms
+    // only an idiot busywaits that long
+    // clamp it at 100ms
+    if ( clks > 12500000 ) {
+        clks = 12500000;
+    }
+    // it takes about 25 clocks to run this code when clks = 0
+    if ( clks > 25 ) {
+        clks -= 25;
+    } else {
+        clks = 0;
+    }
+    start = systick_hw->cvr;
+    do {
+        now = systick_hw->cvr;
+        dt = (start - now) & 0x00FFFFFF;
+    } while ( dt < clks );
+}
+
+void delay_us(uint32_t us)
+{
+    // systick rolls over at 2^24 = 134ms
+    // only an idiot busywaits that long
+    // clamp it at 100ms
+    if ( us > 100000 ) {
+        us = 100000;
+    }
+    if ( us == 0 ) {
+        return;
+    }
+    // subtract 26 clocks for call overhead
+    delay_clks(us*125-26);
+}
+
+void delay_ms(uint32_t ms)
+{
+    // sometimes I'm an idiot and do long busywaits
+    while ( ms > 0 ) {
+        delay_us(1000);
+        ms--;
+    }
+}
+
+
+
 
 p3n_buffer_t *buffers[NUM_BUFFERS];
 
@@ -712,32 +909,73 @@ void p3n_test(void)
     rb = p3n_init();
     assert(rb);
     // transmit channel
-    rb = p3n_configure_chan(0, P3N_NO_PIN, 9, P3N_NO_PIN, BITRATE);
+    rb = p3n_configure_chan(0, &port_tx, BITRATE, 10);
     assert(rb);
     // receive channel (on same pin, I'm looping back)
-    rb = p3n_configure_chan(1, 9, P3N_NO_PIN, P3N_NO_PIN, BITRATE);
+    rb = p3n_configure_chan(1, &port_rx, BITRATE, 10);
     assert(rb);
 
     while(1) {
+        int index[4];
 
-        copy_string_to_buffer(buffers[0], "hi!");
-        erase_buffer(buffers[1]);
-        print_buffer(buffers[0]);
-        print_buffer(buffers[1]);
+        copy_string_to_buffer(buffers[0], "msg1");
+        copy_string_to_buffer(buffers[1], "and2");
+        erase_buffer(buffers[2]);
+        erase_buffer(buffers[3]);
+//        print_buffer(buffers[0]);
+//        print_buffer(buffers[1]);
+//        print_buffer(buffers[2]);
+//        print_buffer(buffers[3]);
         printf("start receive\n");
         gpio_put(SCOPE_CHAN_1, 1);
-        p3n_receive(1, buffers[1], 10);
+        index[0] = p3n_queue_receive_cmd(1, buffers[2], 10);
+        index[1] = p3n_queue_receive_cmd(1, buffers[3], 10);
 //        printf("receive state = %d\n", p3n_chans[1].state);
 //        printf("start transmit\n");
-        p3n_transmit(0, buffers[0], 15);
-//        printf("transmit state = %d\n", p3n_chans[0].state);
-        while ( p3n_chans[0].state != CHAN_ST_IDLE );
+        index[2] = p3n_queue_transmit_cmd(0, buffers[0], 15);
+        index[3] = p3n_queue_transmit_cmd(0, buffers[1], 20);
         gpio_put(SCOPE_CHAN_1, 0);
-        printf("transmitter state is now idle\n");
-        printf("receive state = %d\n", p3n_chans[1].state);
-        print_buffer(buffers[0]);
-        print_buffer(buffers[1]);
+    
+//        while ( p3n_get_cmd_state(0, index[3]) != P3N_CMD_ST_DONE ) {
+//            printf("%d %d %d %d\n", p3n_get_cmd_state(1, index[0]),
+//                                    p3n_get_cmd_state(1, index[1]),
+//                                    p3n_get_cmd_state(0, index[2]),
+//                                    p3n_get_cmd_state(0, index[3]) );
+//        }
+//        printf("transmit state = %d\n", p3n_chans[0].state);
+//        printf("transmitter state is now idle\n");
+//            printf("%d:%d %d:%d %d:%d %d:%d\n", index[0], p3n_get_cmd_state(1, index[0]),
+//                                                index[1], p3n_get_cmd_state(1, index[1]),
+//                                                index[2], p3n_get_cmd_state(0, index[2]),
+//                                                index[3], p3n_get_cmd_state(0, index[3]) );
+        delay_ms(5);
+        if ( p3n_get_cmd_state(1, index[1]) != P3N_CMD_ST_DONE ) {
+            printf("aborting\n");
+            p3n_channel_rx_abort(1);
+        }
+        delay_ms(5);
+            printf("%d:%d %d:%d %d:%d %d:%d\n", index[0], p3n_get_cmd_state(1, index[0]),
+                                                index[1], p3n_get_cmd_state(1, index[1]),
+                                                index[2], p3n_get_cmd_state(0, index[2]),
+                                                index[3], p3n_get_cmd_state(0, index[3]) );
+        printf("receive active_cmd = %p\n", p3n_chans[1].active_cmd);
+//        print_buffer(buffers[0]);
+//        print_buffer(buffers[1]);
+//        print_buffer(buffers[2]);
+//        print_buffer(buffers[3]);
+if ( index[1] < 0 ) {
+    while(1);
+}
+        p3n_cmd_release(1, index[0]);
+        p3n_cmd_release(1, index[1]);
+        p3n_cmd_release(0, index[2]);
+        p3n_cmd_release(0, index[3]);
+            printf("%d:%d %d:%d %d:%d %d:%d\n", index[0], p3n_get_cmd_state(1, index[0]),
+                                                index[1], p3n_get_cmd_state(1, index[1]),
+                                                index[2], p3n_get_cmd_state(0, index[2]),
+                                                index[3], p3n_get_cmd_state(0, index[3]) );
         delay_ms(5000);
+        //while(1);
     
     };
 

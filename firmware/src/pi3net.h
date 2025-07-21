@@ -3,17 +3,27 @@
  * pi3net.h - header for Pi Pico PIO Networking
  * 
  * 
- * a couple of key concepts for this library:
+ * Some key concepts for this library:
  * 
  * 
  *   A "channel" is a combination of a PIO state machine
- *   and a DMA channel, which cdoes the actual work of sending
+ *   and a DMA channel, which does the actual work of sending
  *   or receiving data.  The number of channels determines
  *   how many messages can be in progress at any given time.
  *   The number of channels is set at compile time by
  *   P3N_NUM_CHAN.  There can be no more than four, since
  *   a PIO has only four state machines.  A channel can be
  *   configured to send data on any pins and at any bit rate.
+ *
+ *   A "port" is a set of pins that can be used to send
+ *   and/or receive data.  Typically you would declare a
+ *   port struct for each hardware Pi3Net link you want to
+ *   use, then pass that struct to p3n_configure_chan().
+ *
+ *   A "buffer" is a data structure that holds either a
+ *   message that you want to transmit, or has space for
+ *   a message that you expect to receive.
+ *
  *
  *
  *
@@ -39,18 +49,24 @@ static_assert(P3N_NUM_CHAN <= NUM_PIO_STATE_MACHINES);
  * hardware; is it transmit only, recieve only, or both?
  * Does it use a pin to enable an external line driver?
  */
-#define P3N_NO_PIN 0x20
-#define P3N_PIN_BITS BITS2STORE(P3N_NO_PIN)
+#define P3N_NO_PIN 0xFF
 
 typedef struct p3n_port_s {
-    uint32_t rx_pin             : P3N_PIN_BITS;
-    uint32_t tx_pin             : P3N_PIN_BITS;
-    uint32_t tx_ena_pin         : P3N_PIN_BITS;
+    uint8_t rx_pin;
+    uint8_t tx_pin;
+    uint8_t tx_ena_pin;
 } p3n_port_t;
 
-static_assert((P3N_PIN_BITS * 3) <= 32);
-static_assert(sizeof(p3n_port_t) == 4 );
-
+/**********************************************************
+ * This enum defines the possible states of a command
+ */
+typedef enum {
+    P3N_CMD_ST_AVAIL = 0,
+    P3N_CMD_ST_QUEUED,
+    P3N_CMD_ST_ACTIVE,
+    P3N_CMD_ST_DONE,
+    P3N_CMD_ST_ERROR
+} p3n_cmd_state_t;
 
 /**********************************************************
  * This structure defines a buffer for message data.
@@ -83,7 +99,8 @@ void p3n_buffer_free(p3n_buffer_t *buf);
 
 /**********************************************************
  * Appends a CRC to a message.  This should be called
- * before sending a message.
+ * before sending a message.  If buf->data_len is not a
+ * multiple of 4, the data will be padded with zeros.
  *
  * NOTE: there is a good chance this will become private
  *
@@ -102,45 +119,6 @@ void p3n_buffer_add_crc32(p3n_buffer_t *buf);
  */
 bool p3n_buffer_check_crc32(p3n_buffer_t *buf);
 
-#if 0
-/**********************************************************
- * This structure defines a command for a channel.
- * It determines whether the channel should transmit or
- * receive, what hardware port it should use, and how
- * long it should wait before processing the next
- * command.
- */
-
-typedef enum {
-    P3N_CMD_RECEIVE = 0,
-    P3N_CMD_TRANSMIT,
-    P3N_MAXCMDTYPE
-} p3n_cmd_type_t;
-
-typedef enum {
-    P3N_CMD_WAITING = 0,
-    P3N_CMD_ACTIVE,
-    P3N_CMD_DONE,
-    P3N_MAXCMDSTATE
-} p3n_cmd_state_t;
-
-#define CMD_TYPE_BITS   (BITS2STORE(P3N_MAXCMDTYPE))
-#define CMD_STATE_BITS  (BITS2STORE(P3N_MAXCMDSTATE))
-
-typedef struct p3n_cmd_s {
-    p3n_cmd_type_t          cmd_type    : CMD_TYPE_BITS;
-    p3n_cmd_state_t         cmd_state   : CMD_STATE_BITS;
-    struct p3n_port_s      *port;
-    struct p3n_buffer_s    *buf;
-    uint32_t                delay;
-    struct p3n_cmd_s       *next_cmd;
-} p3n_cmd_t;
-
-static_assert((CMD_TYPE_BITS + CMD_STATE_BITS) <= 32);
-static_assert(sizeof(p3n_cmd_t) == 20 );
-#endif
-
-
 /**********************************************************
  * Initializes global pi3net data including acquiring PIO
  * and DMA resources.  It will attempt to reserve 
@@ -155,37 +133,84 @@ bool p3n_init(void);
 void p3n_uninit(void);
 
 /**********************************************************
- * Configure the specified channel to send/receive data
- * using the specified pins and bit rate.
- * Fails if the channel is currently busy.
+ * Configure the specified channel to send and/or receive
+ * data using a specified port (set of pins) and bit rate.
+ * Reserves memory for a command queue with 'queue_len'
+ * entries.  Fails if the channel is currently busy or
+ * if any of the inputs are out of range.
  */
-bool p3n_configure_chan(uint ch_num, uint rx_pin, uint tx_pin, uint tx_ena_pin, uint bitrate);
-
+bool p3n_channel_configure(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len);
 
 /**********************************************************
- * Tell 'chan' to start listening for a message, capturing
- * incoming data to 'buf'.  Once a message is received,
- * wait 'delay' bit times before starting next command.
+ * Queue a receive command for channel 'chan'.  Incoming
+ * data will be captured to 'buf'.  Once a message is
+ * received, the channel will wait 'delay' bit times
+ * before starting the next command.
+ *
+ * Returns an index that can be used to check the command
+ * status, or a negative error code on failure.
  */
-bool p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t delay);
+int p3n_queue_receive_cmd(uint ch_num, p3n_buffer_t *buf, uint32_t delay);
 
 /**********************************************************
- * Tell 'chan' to start sending a message from 'buf'.
- * Once message is sent, wait 'delay' bit times before
- * starting next command.
+ * Queue a transmit command for channel 'chan'.  Data will
+ * be sent from 'buf'.  Once the message is transmitted,
+ * the channel will wait 'delay' bit times before starting
+ * the next command.
+ *
+ * Returns an index that can be used to check the command
+ * status, or a negative error code on failure.
  */
-bool p3n_transmit(uint ch_num, p3n_buffer_t *buf, uint32_t delay);
+int p3n_queue_transmit_cmd(uint ch_num, p3n_buffer_t *buf, uint32_t delay);
 
+/**********************************************************
+ * Returns the state of a command that was previously
+ * placed in the command queue for 'ch_num'.  'cmd_index'
+ * is the index returned when the command was queued.
+ */
+p3n_cmd_state_t p3n_get_cmd_state(uint ch_num, int cmd_index);
 
+/**********************************************************
+ * Returns the buffer associated with a command that was
+ * previously placed in the command queue for 'ch_num'.
+ * 'cmd_index' is the index returned when the command
+ * was queued.  
+ */
+p3n_buffer_t *p3n_get_cmd_buffer(uint ch_num, int cmd_index);
 
+/**********************************************************
+ * Switches a command queue entry from the "done" state
+ * to the "available" state.  An application calls this
+ * function once it has processed a received message, or
+ * any time after a transmitted message has been sent.
+ * It disassociates the message buffer from the commane
+ * queue entry so that the buffer can be reused.
+ * Returns false if the command is not done.
+ */
+bool p3n_cmd_release(uint ch_num, int cmd_index);
 
+/**********************************************************
+ * Cancels all queued commands for channel 'ch_num',
+ * returning the command queue entries to the 'available'
+ * state.
+ */
+void p3n_channel_full_abort(uint ch_num);
 
-#if 0
+/**********************************************************
+ * If 'ch_num' is currently waiting to receive a message,
+ * this function skips the receive and its post-command
+ * delay, allowing the next queued command (if any) to
+ * run.  If not waiting for receive, does nothing.
+ */
+void p3n_channel_rx_abort(uint ch_num);
 
-bool p3n_create_transmit_command(p3n_cmd_t *cmd, p3n_port_t port, uint32_t speed, uint32_t delay, uint32_t data_len, char *data);
-bool p3n_create_receive_command(p3n_cmd_t *cmd, p3n_port_t port, uint32_t speed, uint32_t delay, uint32_t max_len, char *data);
-#endif
-
+/**********************************************************
+ * If 'ch_num' is currently in a post-command delay, this
+ * function skips the delay, allowing the next queued
+ * command (if any) to run.  If not in a post-command
+ * delay, does nothing.
+ */
+void p3n_channel_delay_abort(uint ch_num);
 
 void p3n_test(void);
 
