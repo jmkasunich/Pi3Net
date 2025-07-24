@@ -174,7 +174,7 @@ p3n_cmd_state_t p3n_get_cmd_state(uint ch_num, int cmd_index);
  * Returns the buffer associated with a command that was
  * previously placed in the command queue for 'ch_num'.
  * 'cmd_index' is the index returned when the command
- * was queued.  
+ * was queued.
  */
 p3n_buffer_t *p3n_get_cmd_buffer(uint ch_num, int cmd_index);
 

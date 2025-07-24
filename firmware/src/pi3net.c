@@ -830,62 +830,7 @@ const p3n_port_t port_tx = { P3N_NO_PIN, 9, P3N_NO_PIN };
 #define NUM_BUFFERS 6
 
 
-
-// FIXME - this code should live somewhere else
-// I'm astonished that the SDK doesn't have a proper busywait
-
-#include "hardware/structs/systick.h"
-
-
-void delay_clks(uint32_t clks)
-{
-    uint32_t start, now, dt;
-
-    // systick rolls over at 2^24 = 134ms
-    // only an idiot busywaits that long
-    // clamp it at 100ms
-    if ( clks > 12500000 ) {
-        clks = 12500000;
-    }
-    // it takes about 25 clocks to run this code when clks = 0
-    if ( clks > 25 ) {
-        clks -= 25;
-    } else {
-        clks = 0;
-    }
-    start = systick_hw->cvr;
-    do {
-        now = systick_hw->cvr;
-        dt = (start - now) & 0x00FFFFFF;
-    } while ( dt < clks );
-}
-
-void delay_us(uint32_t us)
-{
-    // systick rolls over at 2^24 = 134ms
-    // only an idiot busywaits that long
-    // clamp it at 100ms
-    if ( us > 100000 ) {
-        us = 100000;
-    }
-    if ( us == 0 ) {
-        return;
-    }
-    // subtract 26 clocks for call overhead
-    delay_clks(us*125-26);
-}
-
-void delay_ms(uint32_t ms)
-{
-    // sometimes I'm an idiot and do long busywaits
-    while ( ms > 0 ) {
-        delay_us(1000);
-        ms--;
-    }
-}
-
-
-
+#include "timing.h"
 
 p3n_buffer_t *buffers[NUM_BUFFERS];
 
@@ -948,12 +893,12 @@ void p3n_test(void)
 //                                                index[1], p3n_get_cmd_state(1, index[1]),
 //                                                index[2], p3n_get_cmd_state(0, index[2]),
 //                                                index[3], p3n_get_cmd_state(0, index[3]) );
-        delay_ms(5);
+        tm_delay_ms(5);
         if ( p3n_get_cmd_state(1, index[1]) != P3N_CMD_ST_DONE ) {
             printf("aborting\n");
             p3n_channel_rx_abort(1);
         }
-        delay_ms(5);
+        tm_delay_ms(5);
             printf("%d:%d %d:%d %d:%d %d:%d\n", index[0], p3n_get_cmd_state(1, index[0]),
                                                 index[1], p3n_get_cmd_state(1, index[1]),
                                                 index[2], p3n_get_cmd_state(0, index[2]),
@@ -974,7 +919,7 @@ if ( index[1] < 0 ) {
                                                 index[1], p3n_get_cmd_state(1, index[1]),
                                                 index[2], p3n_get_cmd_state(0, index[2]),
                                                 index[3], p3n_get_cmd_state(0, index[3]) );
-        delay_ms(5000);
+        tm_delay_ms(5000);
         //while(1);
     
     };
