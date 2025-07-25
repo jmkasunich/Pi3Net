@@ -2,9 +2,7 @@
  * 
  * pi3net.h - header for Pi Pico PIO Networking
  * 
- * 
  * Some key concepts for this library:
- * 
  * 
  *   A "channel" is a combination of a PIO state machine
  *   and a DMA channel, which does the actual work of sending
@@ -24,16 +22,11 @@
  *   message that you want to transmit, or has space for
  *   a message that you expect to receive.
  *
- *
- *
- *
  **************************************************************/
 #ifndef PI3NET_H
 #define PI3NET_H
 
 #include <stdint.h>    // int32_t, uint32_t
-
-#define BITS2STORE(n) (32-(__builtin_clz((n))))
 
 /**********************************************************
  * The number of channels desired, from 1 to 4.
@@ -69,6 +62,23 @@ typedef enum {
 } p3n_cmd_state_t;
 
 /**********************************************************
+ * This enum defines the possible error codes
+ */
+typedef enum { 
+    P3N_SUCCESS             =  0,
+    P3N_ERR_BAD_CHAN        = -1,
+    P3N_ERR_BAD_BUFFER      = -2,
+    P3N_ERR_BAD_DELAY       = -3,
+    P3N_ERR_BAD_PIN         = -4,
+    P3N_ERR_CHAN_UNINIT     = -5,
+    P3N_ERR_CHAN_BUSY       = -6,
+    P3N_ERR_QUEUE_FULL      = -7,
+    P3N_ERR_BAD_INDEX       = -8,
+    P3N_ERR_BAD_TIMEOUT     = -9
+} p3n_retval_t;
+
+
+/**********************************************************
  * This structure defines a buffer for message data.
  *
  * Note that the actual buffer (at .data) is 4 bytes
@@ -80,8 +90,6 @@ typedef struct p3n_buffer_s {
     uint16_t                data_len;
     char                   *data;
 } p3n_buffer_t;
-
-static_assert(sizeof(p3n_buffer_t) == 8 );
 
 /**********************************************************
  * Create a buffer for message data.  Both the p3n_buf_t
@@ -139,7 +147,26 @@ void p3n_uninit(void);
  * entries.  Fails if the channel is currently busy or
  * if any of the inputs are out of range.
  */
-bool p3n_channel_configure(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len);
+bool p3n_channel_config(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len);
+
+/**********************************************************
+ * Blocking receive.  Tells channel 'ch_num' to listen for
+ * an incoming message, storing the received data in 'buf'.
+ * Returns immediately for bad arguments or if the channel
+ * is busy.  Otherwise, returns when a message has been
+ * received, or after 'timeout_us' microseconds, whichever
+ * comes first.
+ * Check 'buf->data_len' to see if a message was received.
+ */
+p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us);
+
+/**********************************************************
+ * Blocking transmit.  Tells channel 'ch_num' to send the
+ * data in 'buf'.  Returns immediately for bad arguments
+ * or of the channel is busy.  Otherwise, returns when
+ * the message has been sent.
+ */
+p3n_retval_t p3n_transmit(uint ch_num, p3n_buffer_t *buf);
 
 /**********************************************************
  * Queue a receive command for channel 'chan'.  Incoming

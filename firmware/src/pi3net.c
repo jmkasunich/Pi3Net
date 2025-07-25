@@ -5,6 +5,7 @@
 #include "pi3net.pio.h"
 #include "hardware/dma.h"
 #include "hardware/sync.h"
+#include "timing.h"
 
 // bits/word and clocks/bit are set in pi3net.pio
 // and thus come in via pi3net.pio.h
@@ -35,16 +36,6 @@ static_assert(MAX_SILENCE_DELAY > SILENCE_DELAY_TX);
 #define PIO_CMD_RX              ((1<<(COMMAND_SHIFT))|(SILENCE_DELAY_RX))
 #define PIO_CMD_TX              ((0<<(COMMAND_SHIFT))|(SILENCE_DELAY_TX))
 #define PIO_CMD_MASK            ((1<<(COMMAND_SHIFT+1))-1)
-
-
-#define P3N_ERR_BAD_CHAN    (-1)
-#define P3N_ERR_BAD_BUFFER  (-2)
-#define P3N_ERR_BAD_DELAY   (-3)
-#define P3N_ERR_BAD_PIN     (-4)
-#define P3N_ERR_CHAN_UNINIT (-5)
-#define P3N_ERR_QUEUE_FULL  (-6)
-#define P3N_ERR_BAD_INDEX   (-7)
-
 
 /**********************************************************
  * This structure defines a pi3net command.
@@ -491,6 +482,49 @@ static void __time_critical_func(chan_start_next_cmd)(p3n_chan_t *ch)
     } else {
         ch->queue_out = ch->queue_len - 1;
     }
+}
+
+p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us)
+{
+    p3n_chan_t *ch;
+    int index;
+    uint32_t start;
+
+    // validate inputs
+    if ( timeout_us > TM_MAX_TIME_US ) return P3N_ERR_BAD_TIMEOUT;
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_ERR_BAD_CHAN;
+    ch = &(p3n_chans[ch_num]);
+    if ( ch->active_cmd != NULL ) return P3N_ERR_CHAN_BUSY;
+    index = p3n_queue_receive_cmd(ch_num, buf, 0u);
+    if ( index < P3N_SUCCESS ) {
+        return index;
+    }
+    start = tm_get_timestamp();
+    while ( p3n_get_cmd_state(ch_num, index) != P3N_CMD_ST_DONE ) {
+        if ( tm_us_since(start) > timeout_us ) {
+            p3n_channel_rx_abort(ch_num);
+        }        
+    }
+    p3n_cmd_release(ch_num, index);
+    return P3N_SUCCESS;
+}
+
+p3n_retval_t p3n_transmit(uint ch_num, p3n_buffer_t *buf)
+{
+    p3n_chan_t *ch;
+    int index;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_ERR_BAD_CHAN;
+    ch = &(p3n_chans[ch_num]);
+    if ( ch->active_cmd != NULL ) return P3N_ERR_CHAN_BUSY;
+    index = p3n_queue_transmit_cmd(ch_num, buf, 0u);
+    if ( index < P3N_SUCCESS ) {
+        return index;
+    }
+    while ( p3n_get_cmd_state(ch_num, index) != P3N_CMD_ST_DONE );
+    p3n_cmd_release(ch_num, index);
+    return P3N_SUCCESS;
 }
 
 static int queue_cmd(p3n_chan_t *ch, p3n_buffer_t *buf, uint32_t delay, uint32_t pio_cmd)
