@@ -706,7 +706,7 @@ void p3n_channel_full_abort(uint ch_num)
     pio_sm_set_enabled(p3n_pio, ch->sm_index, true);
 }
 
-bool p3n_configure_chan(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len)
+bool p3n_channel_config(uint ch_num, p3n_port_t const *port, uint bitrate, uint8_t queue_len)
 {
     p3n_chan_t *ch;
     p3n_cmd_t *cmd;
@@ -841,18 +841,10 @@ bool p3n_configure_chan(uint ch_num, p3n_port_t const *port, uint bitrate, uint8
 }
 
 
-/*************************************************
- * Port data - normally provided by application
- */
-
-const p3n_port_t port_bus1  = { 16, 16, 17 };
-const p3n_port_t port_bus2  = { 22, 22, 28 };
-const p3n_port_t port_up = { 5, 4, P3N_NO_PIN };
-const p3n_port_t port_dn = { 3, 2, P3N_NO_PIN };
-const p3n_port_t port_rx = { 9, P3N_NO_PIN, P3N_NO_PIN };
-const p3n_port_t port_tx = { P3N_NO_PIN, 9, P3N_NO_PIN };
 
 // testing stuff
+
+#if 0
 
 #define SCOPE_CHAN_1  (10)
 #define SCOPE_CHAN_2  (14)
@@ -1097,4 +1089,4 @@ print_buffer(buffers[0]);
 #endif
 }
 
-
+#endif // test code
