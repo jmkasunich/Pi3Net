@@ -109,9 +109,8 @@ void p3n_buffer_free(p3n_buffer_t *buf);
  * Appends a CRC to a message.  This should be called
  * before sending a message.  If buf->data_len is not a
  * multiple of 4, the data will be padded with zeros.
- *
- * NOTE: there is a good chance this will become private
- *
+ * buf->data_len will be incremented by 4 to indicate 
+ * the presence of the CRC.
  */
 void p3n_buffer_add_crc32(p3n_buffer_t *buf);
 
@@ -121,9 +120,6 @@ void p3n_buffer_add_crc32(p3n_buffer_t *buf);
  * and the function returns true, otherwise no change to
  * the buffer and returns false.  This should be called
  * after receiving a message.
- *
- * NOTE: there is a good chance this will become private
- *
  */
 bool p3n_buffer_check_crc32(p3n_buffer_t *buf);
 

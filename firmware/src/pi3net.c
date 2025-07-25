@@ -192,24 +192,30 @@ static uint32_t crc32_result(void)
 void p3n_buffer_add_crc32(p3n_buffer_t *buf)
 {
     // if data is not a multiple of 4 bytes, pad it with zeros
-    while ( buf->data_len & ~3u ) {
+    while ( buf->data_len & 3u ) {
         buf->data[buf->data_len++] = 0;
     }
-    crc32_start((uint32_t *)buf->data, (buf->data_len >> 2));
-    // append CRC to data
-    *(uint32_t *)&(buf->data[buf->data_len]) = crc32_result();
+    // make sure there is room for the CRC
+    if ( buf->data_len <= buf->max_len ) {
+        crc32_start((uint32_t *)buf->data, (buf->data_len >> 2));
+        // append CRC to data
+        *(uint32_t *)&(buf->data[buf->data_len]) = crc32_result();
+        buf->data_len += 4u;
+    }
 }
 
 bool p3n_buffer_check_crc32(p3n_buffer_t *buf)
 {
     // data must be a multiple of 4 bytes
-    assert((buf->data_len & ~3) == 0 );
+    if ( (buf->data_len & 3) != 0 ) {
+        return false;
+    }
     // and must be at least 4 (the CRC itself)
     if ( buf->data_len < 4 ) {
         return false;
     }
     crc32_start((uint32_t *)buf->data, (buf->data_len >> 2) - 1);
-    if ( crc32_result() == *(uint32_t *)&(buf->data[buf->data_len]) ) {
+    if ( crc32_result() == *(uint32_t *)&(buf->data[buf->data_len - 4]) ) {
         buf->data_len -= 4;
         return true;
     }
