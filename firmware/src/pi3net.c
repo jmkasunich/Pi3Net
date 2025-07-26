@@ -468,7 +468,7 @@ static void __time_critical_func(chan_start_next_cmd)(p3n_chan_t *ch)
         // start the DMA transfer
         dma_channel_configure(ch->dma_index, &ch->rx_dma_config, cmd->buf->data,
                                 ((char *)&(p3n_pio->rxf[ch->sm_index]))+(4-BYTES_PER_WORD),
-                                cmd->buf->max_len / BYTES_PER_WORD, true);
+                                (cmd->buf->max_len+4) / BYTES_PER_WORD, true);
         // send command to the PIO
         pio_sm_put(p3n_pio, ch->sm_index, cmd->pio_cmd);
     } else {
