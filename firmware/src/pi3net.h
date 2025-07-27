@@ -150,11 +150,20 @@ bool p3n_channel_config(uint ch_num, p3n_port_t const *port, uint bitrate, uint8
  * an incoming message, storing the received data in 'buf'.
  * Returns immediately for bad arguments or if the channel
  * is busy.  Otherwise, returns when a message has been
- * received, or after 'timeout_us' microseconds, whichever
- * comes first.
+ * received.
+ */
+p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf);
+
+/**********************************************************
+ * Blocking receive with timeout.  Tells channel 'ch_num'
+ * to listen for an incoming message, storing the received
+ * data in 'buf'.  Returns immediately for bad arguments
+ * or if the channel is busy.  Otherwise, returns when a
+ * message has been received, or after 'timeout_us'
+ * microseconds, whichever comes first.
  * Check 'buf->data_len' to see if a message was received.
  */
-p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us);
+p3n_retval_t p3n_receive_timeout(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us);
 
 /**********************************************************
  * Blocking transmit.  Tells channel 'ch_num' to send the

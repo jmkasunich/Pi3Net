@@ -492,7 +492,25 @@ static void __time_critical_func(chan_start_next_cmd)(p3n_chan_t *ch)
     }
 }
 
-p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us)
+p3n_retval_t p3n_receive(uint ch_num, p3n_buffer_t *buf)
+{
+    p3n_chan_t *ch;
+    int index;
+
+    // validate inputs
+    if ( ch_num >= P3N_NUM_CHAN) return P3N_ERR_BAD_CHAN;
+    ch = &(p3n_chans[ch_num]);
+    if ( ch->active_cmd != NULL ) return P3N_ERR_CHAN_BUSY;
+    index = p3n_queue_receive_cmd(ch_num, buf, 0u);
+    if ( index < P3N_SUCCESS ) {
+        return index;
+    }
+    while ( p3n_get_cmd_state(ch_num, index) != P3N_CMD_ST_DONE );
+    p3n_cmd_release(ch_num, index);
+    return P3N_SUCCESS;
+}
+
+p3n_retval_t p3n_receive_timeout(uint ch_num, p3n_buffer_t *buf, uint32_t timeout_us)
 {
     p3n_chan_t *ch;
     int index;
