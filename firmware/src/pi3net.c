@@ -191,6 +191,8 @@ static uint32_t crc32_result(void)
 
 void p3n_buffer_add_crc32(p3n_buffer_t *buf)
 {
+    // don't add CRC to an empty buffer
+    if ( buf->data_len == 0 ) return;
     // if data is not a multiple of 4 bytes, pad it with zeros
     while ( buf->data_len & 3u ) {
         buf->data[buf->data_len++] = 0;
@@ -210,8 +212,8 @@ bool p3n_buffer_check_crc32(p3n_buffer_t *buf)
     if ( (buf->data_len & 3) != 0 ) {
         return false;
     }
-    // and must be at least 4 (the CRC itself)
-    if ( buf->data_len < 4 ) {
+    // and must be at least 8 bytes (4 data bytes plus the CRC itself)
+    if ( buf->data_len < 8 ) {
         return false;
     }
     crc32_start((uint32_t *)buf->data, (buf->data_len >> 2) - 1);
