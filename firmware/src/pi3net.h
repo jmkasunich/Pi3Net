@@ -26,7 +26,8 @@
 #ifndef PI3NET_H
 #define PI3NET_H
 
-#include <stdint.h>    // int32_t, uint32_t
+#include "pico/stdlib.h"
+
 
 /**********************************************************
  * The number of channels desired, from 1 to 4.
@@ -35,7 +36,7 @@
 #define P3N_NUM_CHAN     4
 #endif
 
-static_assert(P3N_NUM_CHAN <= NUM_PIO_STATE_MACHINES);
+_Static_assert(P3N_NUM_CHAN <= NUM_PIO_STATE_MACHINES);
 
 /**********************************************************
  * This structure defines a port in terms of the available
